@@ -15,7 +15,7 @@ use {bash::BashTool, edit::EditTool, read::ReadTool, search_files::SearchFilesTo
 
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        // Box::new(ReadTool),
+        Box::new(ReadTool::new()),
         // Box::new(WriteTool),
         // Box::new(EditTool),
         // Box::new(SearchFilesTool),
