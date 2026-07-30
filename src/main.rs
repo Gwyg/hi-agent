@@ -4,7 +4,7 @@ mod llm;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    let client = llm::LlmClient::new();
+    let client = llm::LlmClient::new(llm::Toolbox::new().definitions());
     let messages = vec![llm::user("你好")];
 
     let response = client.chat(messages).await?;

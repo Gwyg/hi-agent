@@ -25,11 +25,13 @@ pub enum ChatResponse {
 pub struct LlmClient {
     inner: Client<OpenAIConfig>,
     model: String,
-    tools: Vec<ChatCompletionTools>,
+    /// 工具 schema 集合(纯数据,不持可执行对象),构造请求时 clone 喂给 LLM
+    tool_defs: Vec<ChatCompletionTools>,
 }
 
 impl LlmClient {
-    pub fn new() -> Self {
+    /// `tool_defs` 来自 Toolbox::definitions(),client 不持工具对象,只管 schema
+    pub fn new(tool_defs: Vec<ChatCompletionTools>) -> Self {
         let config = OpenAIConfig::new()
             .with_api_key(std::env::var("API_KEY").unwrap_or_default())
             .with_api_base(
@@ -39,15 +41,16 @@ impl LlmClient {
         Self {
             inner: Client::with_config(config),
             model: std::env::var("MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-            tools: super::tools::all(),
+            tool_defs,
         }
     }
 
-    pub fn with_config(config: OpenAIConfig) -> Self {
+    /// 用自定义 config + 工具 schema
+    pub fn with_config(config: OpenAIConfig, tool_defs: Vec<ChatCompletionTools>) -> Self {
         Self {
             inner: Client::with_config(config),
             model: std::env::var("MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-            tools: super::tools::all(),
+            tool_defs,
         }
     }
 
@@ -58,7 +61,7 @@ impl LlmClient {
         let request = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages(messages)
-            .tools(self.tools.clone())
+            .tools(self.tool_defs.clone())
             .build()?;
         let mut response = self.inner.chat().create(request).await?;
         let choice = response
@@ -85,7 +88,7 @@ impl LlmClient {
         let request = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages(messages)
-            .tools(self.tools.clone())
+            .tools(self.tool_defs.clone())
             .build()?;
         let stream = self.inner.chat().create_stream(request).await?;
         Ok(Box::pin(stream))

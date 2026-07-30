@@ -1,7 +1,7 @@
 use async_openai::types::chat::{
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
 };
 
 /// 构造 system 消息(系统提示,一般放消息列表最前)
@@ -31,6 +31,19 @@ pub fn assistant(content: &str) -> ChatCompletionRequestMessage {
             .content(content)
             .build()
             .expect("valid assistant message"),
+    )
+}
+
+/// 构造带 tool_calls 的 assistant 消息(agent 循环回灌"模型说要调工具"那条消息,防模型失忆)
+/// `tool_calls` 直接用模型返回的 tool_calls 原样塞回,保留 id/name/arguments 对应关系
+pub fn assistant_with_tool_calls(
+    tool_calls: Vec<ChatCompletionMessageToolCalls>,
+) -> ChatCompletionRequestMessage {
+    ChatCompletionRequestMessage::Assistant(
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(tool_calls)
+            .build()
+            .expect("valid assistant message with tool_calls"),
     )
 }
 
