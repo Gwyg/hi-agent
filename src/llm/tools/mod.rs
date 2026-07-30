@@ -2,13 +2,25 @@ use async_openai::types::chat::ChatCompletionTools;
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-mod example;
-
-pub use example::EchoTool;
+mod bash;
+mod edit;
+mod read;
+mod search_files;
+mod write;
 
 /// 返回所有工具实例,作为注册点(新增工具:1) 建 tools/xxx.rs  2) mod xxx  3) 这里 push)
+/// 新工具实现完后在此注册,未实现的保持注释不注册(避免 todo!() panic 拖垮 agent)
+#[allow(unused_imports)]
+use {bash::BashTool, edit::EditTool, read::ReadTool, search_files::SearchFilesTool, write::WriteTool};
+
 pub fn all() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(EchoTool)]
+    vec![
+        // Box::new(ReadTool),
+        // Box::new(WriteTool),
+        // Box::new(EditTool),
+        // Box::new(SearchFilesTool),
+        // Box::new(BashTool),
+    ]
 }
 
 /// 工具特征:一个工具 = schema 定义 + 执行逻辑,二者绑定不可分
