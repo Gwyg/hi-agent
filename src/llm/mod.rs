@@ -1,6 +1,6 @@
 mod client;
 mod message;
-mod tools;
+pub mod tools;
 
 pub use client::{ChatResponse, LlmClient};
 #[allow(unused_imports)]

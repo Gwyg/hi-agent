@@ -1,12 +1,9 @@
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use async_trait::async_trait;
-use lru::LruCache;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::Duration;
 
 use super::Tool;
 
@@ -14,15 +11,15 @@ use super::Tool;
 /// 256KB 覆盖 99% 代码文件,日志/数据走流式
 const LARGE_FILE_THRESHOLD: u64 = 256 * 1024;
 
-/// LRU 缓存容量:最多缓存这么多文件
-/// 50 条 × 最坏 512KB(2×256KB)= ~25MB 内存上限
-const CACHE_CAPACITY: usize = 50;
+/// 单次读取行数硬上限(防 limit 巨大把整个大文件读入内存)
+const MAX_LINES_PER_READ: usize = 2000;
+
+/// 同步 IO 超时(防 FIFO/慢盘/NFS 挂死)
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 读取文件内容(无副作用,高频只读操作)
-/// 小文件走 LRU 缓存(命中零 IO),大文件走流式(防 OOM)
-pub struct ReadTool {
-    cache: Mutex<LruCache<String, CacheEntry>>,
-}
+/// 小文件全量读,大文件流式(防 OOM)
+pub struct ReadTool;
 
 #[derive(Deserialize)]
 struct Args {
@@ -33,109 +30,9 @@ struct Args {
     limit: Option<usize>,
 }
 
-/// 缓存条目:存 normalize 后全文 + 预分行 + mtime(失效检测)
-struct CacheEntry {
-    lines: Vec<String>,
-    mtime: SystemTime,
-    size: u64,
-}
-
 impl ReadTool {
     pub fn new() -> Self {
-        // CACHE_CAPACITY 是常量 50,编译期已知非 0;expect 表意图,真出问题早崩暴露 bug
-        let cache = LruCache::new(
-            NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY must be > 0"),
-        );
-        Self {
-            cache: Mutex::new(cache),
-        }
-    }
-
-    /// 小文件路径:查缓存 → 命中切片,未命中全读入缓存
-    fn read_cached(
-        &self,
-        path: &str,
-        offset: usize,
-        limit: Option<usize>,
-        meta: std::fs::Metadata,
-    ) -> anyhow::Result<String> {
-        let size = meta.len();
-        let mtime = meta.modified()?;
-
-        // 查缓存(mtime + size 检测失效)
-        let cached = {
-            let mut cache = self.lock_cache()?;
-            cache
-                .get(path)
-                .filter(|e| e.mtime == mtime && e.size == size)
-                .map(|e| e.lines.clone())
-        };
-
-        // 命中:直接切片返,不重读
-        if let Some(lines) = cached {
-            return Ok(format_lines(&lines, offset, limit));
-        }
-
-        // 未命中/失效:读文件(不持锁,避免锁内长 IO)
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("读取失败 {}: {e}", path))?;
-        let lines = decode_and_split(&bytes, path)?;
-
-        // 入缓存
-        let mut cache = self.lock_cache()?;
-        cache.put(
-            path.to_string(),
-            CacheEntry {
-                lines: lines.clone(),
-                mtime,
-                size,
-            },
-        );
-
-        Ok(format_lines(&lines, offset, limit))
-    }
-
-    /// 锁缓存,锁中毒转 Err 而非 panic
-    fn lock_cache(&self) -> anyhow::Result<std::sync::MutexGuard<LruCache<String, CacheEntry>>> {
-        self.cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("缓存锁中毒: {e}"))
-    }
-
-    /// 大文件路径:流式 BufReader 顺序扫到 offset,读 limit 行(防 OOM)
-    fn read_streaming(
-        &self,
-        path: &str,
-        offset: usize,
-        limit: Option<usize>,
-    ) -> anyhow::Result<String> {
-        let file = File::open(path).map_err(|e| anyhow::anyhow!("打开失败 {}: {e}", path))?;
-        let reader = BufReader::new(file);
-        let start = offset.saturating_sub(1);
-        let end = limit.map(|l| start + l);
-
-        let mut out = String::new();
-        let mut line_no = 0;
-        for line in reader.lines() {
-            line_no += 1;
-            if line_no <= start {
-                continue;
-            }
-            if let Some(end) = end {
-                if line_no > end {
-                    break;
-                }
-            }
-            // lines() 解码失败说明非 UTF-8(含二进制),统一报错带引导
-            let line = line.map_err(|e| anyhow::anyhow!(
-                "读取失败 {}: {e}。\n\
-                 可能是二进制(用 bash `file {}` 查类型)或非 UTF-8 编码(可用 `iconv` 转换)",
-                path, path
-            ))?;
-            let line = line.trim_end_matches('\r');
-            out.push_str(&format!("{line_no:>6}\t{line}\n"));
-        }
-        Ok(out)
+        Self
     }
 }
 
@@ -180,18 +77,87 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, args: &str) -> anyhow::Result<String> {
-        let args: Args = serde_json::from_str(args)?;
-        let offset = args.offset.unwrap_or(1);
+        let args: Args = serde_json::from_str(args)
+            .map_err(|e| anyhow::anyhow!("read 参数解析失败: {e}"))?;
+        let offset = args.offset.unwrap_or(1).max(1);
 
-        let meta = std::fs::metadata(&args.path)
-            .map_err(|e| anyhow::anyhow!("访问失败 {}: {e}", args.path))?;
+        // 路径解析:相对路径拼项目根,绝对路径直通
+        // read 放宽沙箱:允许读项目外(读不破坏,有时需读全局配置),仍拒软链/特殊文件
+        let path = super::sandbox::resolve_path(&args.path)?;
+        let path_str = path.display().to_string();
 
-        if meta.len() > LARGE_FILE_THRESHOLD {
-            self.read_streaming(&args.path, offset, args.limit)
-        } else {
-            self.read_cached(&args.path, offset, args.limit, meta)
+        // 安全校验:拒软链 + 拒非普通文件(FIFO/设备/socket 会阻塞或无限读)
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| anyhow::anyhow!("访问失败 {}: {e}", path_str))?;
+        if meta.file_type().is_symlink() {
+            return Err(anyhow::anyhow!(
+                "拒绝符号链接 {} —— 可能逃逸项目沙箱。如需读取目标,请用绝对路径显式调用",
+                path_str
+            ));
         }
+        if !meta.is_file() {
+            return Err(anyhow::anyhow!(
+                "拒绝非普通文件 {} —— FIFO/设备/socket 会阻塞读取或导致 OOM",
+                path_str
+            ));
+        }
+
+        let size = meta.len();
+        let path_for_blocking = path.clone();
+
+        // spawn_blocking 隔离同步 IO,超时兜底 FIFO/慢盘/NFS 挂死
+        let read_result = tokio::time::timeout(
+            READ_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let path = path_for_blocking;
+                let path_str = path.display().to_string();
+                if size > LARGE_FILE_THRESHOLD {
+                    read_streaming(&path_str, offset, args.limit)
+                } else {
+                    std::fs::read(&path)
+                        .map_err(|e| anyhow::anyhow!("读取失败 {}: {e}", path_str))
+                        .and_then(|bytes| {
+                            let lines = decode_and_split(&bytes, &path_str)?;
+                            Ok(format_lines(&lines, offset, args.limit))
+                        })
+                }
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("读取超时(>{:?}): {}", READ_TIMEOUT, path_str))?
+        .map_err(|e| anyhow::anyhow!("读取任务失败: {e}"))??;
+
+        Ok(read_result)
     }
+}
+
+/// 流式读:BufReader 顺序扫到 offset,读 limit 行(防 OOM)
+fn read_streaming(path: &str, offset: usize, limit: Option<usize>) -> anyhow::Result<String> {
+    let file = File::open(path).map_err(|e| anyhow::anyhow!("打开失败 {}: {e}", path))?;
+    let reader = BufReader::new(file);
+    let start = offset.saturating_sub(1);
+    let cap = limit.unwrap_or(MAX_LINES_PER_READ).min(MAX_LINES_PER_READ);
+    let end = start.saturating_add(cap);
+
+    let mut out = String::new();
+    let mut line_no = 0;
+    for line in reader.lines() {
+        line_no += 1;
+        if line_no <= start {
+            continue;
+        }
+        if line_no > end {
+            break;
+        }
+        let line = line.map_err(|e| anyhow::anyhow!(
+            "读取失败 {}: {e}。\n\
+             可能是二进制(用 bash `file {}` 查类型)或非 UTF-8 编码(可用 `iconv` 转换)",
+            path, path
+        ))?;
+        let line = line.trim_end_matches('\r');
+        out.push_str(&format!("{line_no:>6}\t{line}\n"));
+    }
+    Ok(out)
 }
 
 /// 解码字节 → UTF-8 String → normalize 换行 → 分行
@@ -212,7 +178,7 @@ fn decode_and_split(bytes: &[u8], path: &str) -> anyhow::Result<Vec<String>> {
 fn format_lines(lines: &[String], offset: usize, limit: Option<usize>) -> String {
     let start = offset.saturating_sub(1).min(lines.len());
     let end = match limit {
-        Some(l) => (start + l).min(lines.len()),
+        Some(l) => start.saturating_add(l).min(lines.len()),
         None => lines.len(),
     };
     let mut out = String::new();
@@ -221,4 +187,64 @@ fn format_lines(lines: &[String], offset: usize, limit: Option<usize>) -> String
         out.push_str(&format!("{line_no:>6}\t{line}\n"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_lines_offset_overflow_safe() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        // offset 巨大不应 panic,返回空
+        let out = format_lines(&lines, usize::MAX, Some(10));
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_lines_limit_overflow_safe() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        // limit 巨大不应 panic,截到末尾
+        let out = format_lines(&lines, 1, Some(usize::MAX));
+        assert!(out.contains("a") && out.contains("b"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_fifo() {
+        let fifo = "/tmp/test_fifo";
+        std::fs::remove_file(fifo).ok();
+        nix::unistd::mkfifo(std::path::Path::new(fifo), nix::sys::stat::Mode::S_IRWXU).ok();
+        let tool = ReadTool::new();
+        let args = serde_json::json!({"path": fifo}).to_string();
+        let res = tool.execute(&args).await;
+        assert!(res.is_err(), "FIFO 应被拒绝");
+        std::fs::remove_file(fifo).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlink() {
+        let target = "/tmp/test_read_target.txt";
+        let link = "/tmp/test_read_link.txt";
+        std::fs::write(target, "hello").ok();
+        std::os::unix::fs::symlink(target, link).ok();
+        let tool = ReadTool::new();
+        let args = serde_json::json!({"path": link}).to_string();
+        let res = tool.execute(&args).await;
+        assert!(res.is_err(), "symlink 应被拒绝");
+        std::fs::remove_file(link).ok();
+        std::fs::remove_file(target).ok();
+    }
+
+    #[tokio::test]
+    async fn reads_normal_file() {
+        let path = "/tmp/test_read_normal.txt";
+        std::fs::write(path, "line1\nline2\n").ok();
+        let tool = ReadTool::new();
+        let args = serde_json::json!({"path": path}).to_string();
+        let res = tool.execute(&args).await.unwrap();
+        assert!(res.contains("line1") && res.contains("line2"));
+        std::fs::remove_file(path).ok();
+    }
 }

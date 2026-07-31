@@ -5,6 +5,7 @@ use std::collections::HashMap;
 mod bash;
 mod edit;
 mod read;
+pub mod sandbox;
 mod search_files;
 mod write;
 
@@ -16,10 +17,10 @@ use {bash::BashTool, edit::EditTool, read::ReadTool, search_files::SearchFilesTo
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ReadTool::new()),
-        // Box::new(WriteTool),
-        // Box::new(EditTool),
-        // Box::new(SearchFilesTool),
-        // Box::new(BashTool),
+        Box::new(SearchFilesTool::new()),
+        Box::new(WriteTool::new()),
+        Box::new(EditTool::new()),
+        Box::new(BashTool::new()),
     ]
 }
 
