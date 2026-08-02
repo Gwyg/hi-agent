@@ -1,0 +1,68 @@
+# hi-agent 配置文件
+# sandbox 控制路径边界,permissions 控制工具操作策略
+
+[sandbox]
+# 额外白名单(项目根由 cwd 自动推断,不在此配置)
+# 路径支持 ~ 展开
+extra_allowed = [
+    "~/.hi-agent",
+    "~/.config/hi-agent",
+]
+# 额外敏感后缀(ends_with 匹配,小写),追加到内置清单之上,只能加不能减
+# 内置清单:
+#   家目录凭证目录(starts_with):~/.ssh ~/.aws ~/.kube ~/.gnupg ~/.config/gcloud
+#   后缀(ends_with):.env .envrc .pem .key .p12 .pfx .npmrc .pypirc .netrc
+#                   .bash_history .zsh_history id_rsa id_ed25519 secrets.yml/yaml/json
+# 如 ["id_ecdsa", "id_dsa"]
+sensitive_suffixes = []
+
+# 额外敏感路径前缀(starts_with 匹配,运行时展开 ~),追加到内置清单之上
+# 如 ["~/.config/hi-agent", "/etc/myapp/secrets"]
+sensitive_paths = []
+
+# 权限规则:同工具按声明顺序匹配,先匹配先生效
+# 值格式:
+#   "deny"                 拒绝
+#   "allow"                直接执行
+#   { ask = true }         询问一次,本次会话内不再问
+#   { ask = false }        每次都问
+[permissions.bash]
+"rm -rf /" = "deny"
+"rm -rf ~" = "deny"
+"rm -rf *" = "deny"
+"dd if=* of=/dev/*" = "deny"
+"mkfs*" = "deny"
+":(){:|:&};:" = "deny"
+"rm *" = { ask = false }
+"sudo *" = { ask = false }
+"git push --force *" = { ask = false }
+"git reset --hard" = { ask = false }
+"npm publish" = { ask = false }
+"git push *" = { ask = true }
+"npm install *" = { ask = true }
+"cargo build" = "allow"
+"cargo test" = "allow"
+"cargo check" = "allow"
+"git status" = "allow"
+"git log" = "allow"
+"git diff" = "allow"
+"ls *" = "allow"
+"cat *" = "allow"
+"pwd" = "allow"
+"echo *" = "allow"
+
+[permissions.write]
+"*.env" = { ask = false }
+"*.pem" = { ask = false }
+"*.key" = { ask = false }
+"*id_rsa*" = { ask = false }
+"*id_ed25519*" = { ask = false }
+"*" = { ask = true }
+
+[permissions.edit]
+"*.env" = { ask = false }
+"*.pem" = { ask = false }
+"*.key" = { ask = false }
+"*id_rsa*" = { ask = false }
+"*id_ed25519*" = { ask = false }
+"*" = { ask = true }

@@ -4,8 +4,9 @@ use serde::Deserialize;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::Tool;
+use super::bash_safety;
 use super::sandbox::{project_root, resolve_path};
+use super::{Action, Tool};
 
 /// 执行 shell 命令(有副作用,高危,万能兜底)
 /// 支持超时和工作目录,返回退出码+stdout+stderr
@@ -91,9 +92,16 @@ impl Tool for BashTool {
         })
     }
 
+    fn assess(&self, args: &str) -> Action {
+        let Ok(args) = serde_json::from_str::<Args>(args) else {
+            return Action::Deny("参数解析失败".into());
+        };
+        bash_safety::classify(&args.command)
+    }
+
     async fn execute(&self, args: &str) -> anyhow::Result<String> {
-        let args: Args = serde_json::from_str(args)
-            .map_err(|e| anyhow::anyhow!("bash 参数解析失败: {e}"))?;
+        let args: Args =
+            serde_json::from_str(args).map_err(|e| anyhow::anyhow!("bash 参数解析失败: {e}"))?;
 
         let timeout_secs = args.timeout.unwrap_or(DEFAULT_TIMEOUT);
         // cwd 默认项目根;传了则解析(相对项目根/~/绝对),不做沙箱(bash 是兜底)
@@ -110,19 +118,17 @@ impl Tool for BashTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true); // 超时/drop 时杀直接子进程(进程树 TODO:setsid+killpg/JobObject)
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("启动命令失败(shell={SHELL},cwd={}): {e}", cwd.display()))?;
+        let child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("启动命令失败(shell={SHELL},cwd={}): {e}", cwd.display())
+        })?;
 
         // tokio::process 真异步,wait_with_output 让出 worker,不阻塞 runtime
         // 超时:timeout 返回后 child future 被 drop → kill_on_drop 杀进程
-        let output = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("命令超时(>{timeout_secs}s),进程已杀"))?
-        .map_err(|e| anyhow::anyhow!("命令执行失败: {e}"))?;
+        let output =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+                .await
+                .map_err(|_| anyhow::anyhow!("命令超时(>{timeout_secs}s),进程已杀"))?
+                .map_err(|e| anyhow::anyhow!("命令执行失败: {e}"))?;
 
         let exit_code = output.status.code().unwrap_or(-1);
         // lossy 解码(Windows cmd 可能非 UTF-8),normalize \r\n → \n,截断防刷屏
@@ -209,7 +215,10 @@ mod tests {
         let tool = BashTool::new();
         let args = serde_json::json!({ "command": "pwd" }).to_string();
         let res = tool.execute(&args).await.unwrap();
-        assert!(res.contains(&*dir.to_string_lossy()), "pwd 应为项目根: {res}");
+        assert!(
+            res.contains(&*dir.to_string_lossy()),
+            "pwd 应为项目根: {res}"
+        );
     }
 
     #[test]
@@ -220,4 +229,3 @@ mod tests {
         assert!(out.contains("输出截断"));
     }
 }
-

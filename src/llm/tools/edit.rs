@@ -6,8 +6,8 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use super::Tool;
 use super::sandbox::ensure_within_sandbox;
+use super::{Action, Tool};
 
 /// 文件大小上限(防大文件占内存;超大文件建议 write 重写或 bash sed)
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -80,9 +80,25 @@ impl Tool for EditTool {
         })
     }
 
+    fn assess(&self, args: &str) -> Action {
+        let Ok(args) = serde_json::from_str::<Args>(args) else {
+            return Action::Deny("参数解析失败".into());
+        };
+        // 边界判断(白名单):越界直接 Deny;白名单内统一 Ask(可持久化)
+        // 黑名单(is_sensitive_path)归 read 防泄露,写只走白名单,职责分离
+        if let Err(e) = ensure_within_sandbox(&args.path) {
+            return Action::Deny(format!("路径不可写: {e}"));
+        }
+        // edit 未集成 config 规则,统一工具名作 key(授权一次后所有 edit 跳过)
+        Action::Ask {
+            persistable: true,
+            keys: vec![self.name().to_string()],
+        }
+    }
+
     async fn execute(&self, args: &str) -> anyhow::Result<String> {
-        let args: Args = serde_json::from_str(args)
-            .map_err(|e| anyhow::anyhow!("edit 参数解析失败: {e}"))?;
+        let args: Args =
+            serde_json::from_str(args).map_err(|e| anyhow::anyhow!("edit 参数解析失败: {e}"))?;
 
         // 防无意义编辑(模型误用)
         if args.old_string == args.new_string {
@@ -108,7 +124,12 @@ impl Tool for EditTool {
 }
 
 /// 同步编辑核心:沙箱校验 → 读文件 → 数量校验 + 替换 → 原子写回
-fn edit_sync(path_str: &str, old: &str, new: &str, expected_count: Option<usize>) -> anyhow::Result<String> {
+fn edit_sync(
+    path_str: &str,
+    old: &str,
+    new: &str,
+    expected_count: Option<usize>,
+) -> anyhow::Result<String> {
     // 1. 沙箱校验(复用 sandbox 模块)
     let real_path = ensure_within_sandbox(path_str)?;
 
@@ -158,16 +179,14 @@ fn edit_sync(path_str: &str, old: &str, new: &str, expected_count: Option<usize>
     // 数量匹配,替换 expected 处
     let new_content = content.replacen(old, new, expected);
 
-    // 6. 保留原权限
+    // 6. 保留原权限(仅 Unix)
     #[cfg(unix)]
     let old_perms = std::fs::metadata(&real_path).ok().map(|m| m.permissions());
-    #[cfg(not(unix))]
-    let old_perms: Option<std::fs::Permissions> = None;
 
     // 7. 原子写回(临时文件 + fsync + rename,防崩溃半残)
-    let file_name = real_path.file_name().ok_or_else(|| {
-        anyhow::anyhow!("路径无文件名: {}", real_path.display())
-    })?;
+    let file_name = real_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("路径无文件名: {}", real_path.display()))?;
     let tmp_name = format!(".{}.tmp", file_name.to_string_lossy());
     let tmp_path = real_path.with_file_name(tmp_name);
     atomic_write(&real_path, &tmp_path, new_content.as_bytes())?;
@@ -204,11 +223,10 @@ fn atomic_write(target: &Path, tmp: &Path, data: &[u8]) -> anyhow::Result<usize>
         .map_err(|e| anyhow::anyhow!("fsync 临时文件失败 {}: {e}", tmp.display()))?;
     drop(file);
 
-    std::fs::rename(tmp, target)
-        .map_err(|e| {
-            std::fs::remove_file(tmp).ok();
-            anyhow::anyhow!("rename 失败 {} -> {}: {e}", tmp.display(), target.display())
-        })?;
+    std::fs::rename(tmp, target).map_err(|e| {
+        std::fs::remove_file(tmp).ok();
+        anyhow::anyhow!("rename 失败 {} -> {}: {e}", tmp.display(), target.display())
+    })?;
 
     Ok(data.len())
 }
@@ -228,7 +246,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("foo.txt"), "hello world\nhello rust\n").unwrap();
         super::super::sandbox::set_project_root(dir.clone()).unwrap();
-        super::super::sandbox::set_extra_allowed(super::super::sandbox::default_extra_paths()).unwrap();
+        super::super::sandbox::set_extra_allowed(super::super::sandbox::default_extra_paths())
+            .unwrap();
         dir
     }
 
@@ -246,10 +265,14 @@ mod tests {
             "path": path,
             "old_string": "world",
             "new_string": "WORLD"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await.unwrap();
         assert!(res.contains("1 处替换"), "{}", res);
-        assert_eq!(fs::read_to_string(dir.join("foo.txt")).unwrap(), "hello WORLD\nhello rust\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("foo.txt")).unwrap(),
+            "hello WORLD\nhello rust\n"
+        );
         cleanup(&dir);
     }
 
@@ -265,10 +288,14 @@ mod tests {
             "old_string": "hello",
             "new_string": "hi",
             "expected_count": 2
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await.unwrap();
         assert!(res.contains("2 处替换"), "{}", res);
-        assert_eq!(fs::read_to_string(dir.join("foo.txt")).unwrap(), "hi world\nhi rust\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("foo.txt")).unwrap(),
+            "hi world\nhi rust\n"
+        );
         cleanup(&dir);
     }
 
@@ -284,14 +311,18 @@ mod tests {
             "old_string": "hello",
             "new_string": "hi",
             "expected_count": 1
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "数量不符应拒");
         let msg = res.unwrap_err().to_string();
         assert!(msg.contains("预期 1 处"), "{}", msg);
         assert!(msg.contains("实际 2 处"), "{}", msg);
         // 原内容不变
-        assert_eq!(fs::read_to_string(dir.join("foo.txt")).unwrap(), "hello world\nhello rust\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("foo.txt")).unwrap(),
+            "hello world\nhello rust\n"
+        );
         cleanup(&dir);
     }
 
@@ -306,7 +337,8 @@ mod tests {
             "path": path,
             "old_string": "hello",
             "new_string": "hi"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "多处匹配默认应拒");
         let msg = res.unwrap_err().to_string();
@@ -324,7 +356,8 @@ mod tests {
             "path": path,
             "old_string": "nonexistent",
             "new_string": "x"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "无匹配应拒");
         let msg = res.unwrap_err().to_string();
@@ -342,7 +375,8 @@ mod tests {
             "path": path,
             "old_string": "hello",
             "new_string": "hello"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "相同字符串应拒");
         cleanup(&dir);
@@ -358,7 +392,8 @@ mod tests {
             "path": path,
             "old_string": "a",
             "new_string": "b"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "文件不存在应拒");
         let msg = res.unwrap_err().to_string();
@@ -377,7 +412,8 @@ mod tests {
             "path": subdir,
             "old_string": "a",
             "new_string": "b"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "目录应拒");
         let msg = res.unwrap_err().to_string();
@@ -395,10 +431,14 @@ mod tests {
             "path": path,
             "old_string": "hello world\n",
             "new_string": ""
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await.unwrap();
         assert!(res.contains("1 处替换"), "{}", res);
-        assert_eq!(fs::read_to_string(dir.join("foo.txt")).unwrap(), "hello rust\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("foo.txt")).unwrap(),
+            "hello rust\n"
+        );
         cleanup(&dir);
     }
 }

@@ -5,7 +5,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
-use super::Tool;
+use super::sandbox::is_sensitive_path;
+use super::{Action, Tool};
 
 /// 大文件阈值:超过此大小走流式读(不缓存)
 /// 256KB 覆盖 99% 代码文件,日志/数据走流式
@@ -76,9 +77,25 @@ impl Tool for ReadTool {
         })
     }
 
+    fn assess(&self, args: &str) -> Action {
+        let Ok(args) = serde_json::from_str::<Args>(args) else {
+            return Action::Deny("参数解析失败".into());
+        };
+        // read 不做沙箱边界校验(允许读项目外),只拦敏感文件防泄露
+        // 敏感文件每次必问(persistable=false,不进 grant),keys 空
+        if is_sensitive_path(&args.path) {
+            Action::Ask {
+                persistable: false,
+                keys: Vec::new(),
+            }
+        } else {
+            Action::Allow
+        }
+    }
+
     async fn execute(&self, args: &str) -> anyhow::Result<String> {
-        let args: Args = serde_json::from_str(args)
-            .map_err(|e| anyhow::anyhow!("read 参数解析失败: {e}"))?;
+        let args: Args =
+            serde_json::from_str(args).map_err(|e| anyhow::anyhow!("read 参数解析失败: {e}"))?;
         let offset = args.offset.unwrap_or(1).max(1);
 
         // 路径解析:相对路径拼项目根,绝对路径直通
@@ -149,11 +166,14 @@ fn read_streaming(path: &str, offset: usize, limit: Option<usize>) -> anyhow::Re
         if line_no > end {
             break;
         }
-        let line = line.map_err(|e| anyhow::anyhow!(
-            "读取失败 {}: {e}。\n\
+        let line = line.map_err(|e| {
+            anyhow::anyhow!(
+                "读取失败 {}: {e}。\n\
              可能是二进制(用 bash `file {}` 查类型)或非 UTF-8 编码(可用 `iconv` 转换)",
-            path, path
-        ))?;
+                path,
+                path
+            )
+        })?;
         let line = line.trim_end_matches('\r');
         out.push_str(&format!("{line_no:>6}\t{line}\n"));
     }

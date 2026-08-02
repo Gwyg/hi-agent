@@ -3,11 +3,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use super::Tool;
 use super::sandbox::ensure_within_sandbox;
+use super::{Action, Tool};
 
 /// 内容大小上限(防模型生成超大内容拖慢/占内存)
 const MAX_CONTENT_SIZE: usize = 10 * 1024 * 1024;
@@ -73,9 +73,25 @@ impl Tool for WriteTool {
         })
     }
 
+    fn assess(&self, args: &str) -> Action {
+        let Ok(args) = serde_json::from_str::<Args>(args) else {
+            return Action::Deny("参数解析失败".into());
+        };
+        // 边界判断(白名单):越界直接 Deny;白名单内统一 Ask(可持久化)
+        // 黑名单(is_sensitive_path)归 read 防泄露,写只走白名单,职责分离
+        if let Err(e) = ensure_within_sandbox(&args.path) {
+            return Action::Deny(format!("路径不可写: {e}"));
+        }
+        // write 未集成 config 规则,统一工具名作 key(授权一次后所有 write 跳过)
+        Action::Ask {
+            persistable: true,
+            keys: vec![self.name().to_string()],
+        }
+    }
+
     async fn execute(&self, args: &str) -> anyhow::Result<String> {
-        let args: Args = serde_json::from_str(args)
-            .map_err(|e| anyhow::anyhow!("write 参数解析失败: {e}"))?;
+        let args: Args =
+            serde_json::from_str(args).map_err(|e| anyhow::anyhow!("write 参数解析失败: {e}"))?;
 
         if args.content.len() > MAX_CONTENT_SIZE {
             return Err(anyhow::anyhow!(
@@ -126,22 +142,20 @@ fn write_sync(path_str: &str, content: &str, overwrite: bool) -> anyhow::Result<
         ));
     }
 
-    // 3. 保留原文件权限(覆盖时)
+    // 3. 保留原文件权限(覆盖时,仅 Unix)
     #[cfg(unix)]
     let old_perms = if existed {
         std::fs::metadata(&real_path).ok().map(|m| m.permissions())
     } else {
         None
     };
-    #[cfg(not(unix))]
-    let old_perms: Option<std::fs::Permissions> = None;
 
     // 4. 原子写:写临时文件 → fsync → rename
     //    崩溃时:临时文件残留,目标文件完整(旧或新,不会半残)
     //    临时文件放同目录(rename 跨目录非原子),文件名前缀 . 避免 glob 误匹配
-    let file_name = real_path.file_name().ok_or_else(|| {
-        anyhow::anyhow!("路径无文件名: {}", real_path.display())
-    })?;
+    let file_name = real_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("路径无文件名: {}", real_path.display()))?;
     let tmp_name = format!(".{}.tmp", file_name.to_string_lossy());
     let tmp_path = real_path.with_file_name(tmp_name);
     let bytes_written = atomic_write(&real_path, &tmp_path, content.as_bytes())?;
@@ -153,7 +167,12 @@ fn write_sync(path_str: &str, content: &str, overwrite: bool) -> anyhow::Result<
     }
 
     let action = if existed { "覆盖" } else { "新建" };
-    Ok(format!("已{} {}({} 字节)", action, real_path.display(), bytes_written))
+    Ok(format!(
+        "已{} {}({} 字节)",
+        action,
+        real_path.display(),
+        bytes_written
+    ))
 }
 
 /// 原子写:临时文件 → fsync → rename(Unix rename 原子)
@@ -172,11 +191,10 @@ fn atomic_write(target: &Path, tmp: &Path, data: &[u8]) -> anyhow::Result<usize>
         .map_err(|e| anyhow::anyhow!("fsync 临时文件失败 {}: {e}", tmp.display()))?;
     drop(file); // 关闭 fd,Windows 上 rename 前需关闭
 
-    std::fs::rename(tmp, target)
-        .map_err(|e| {
-            std::fs::remove_file(tmp).ok(); // rename 失败清理临时文件
-            anyhow::anyhow!("rename 失败 {} -> {}: {e}", tmp.display(), target.display())
-        })?;
+    std::fs::rename(tmp, target).map_err(|e| {
+        std::fs::remove_file(tmp).ok(); // rename 失败清理临时文件
+        anyhow::anyhow!("rename 失败 {} -> {}: {e}", tmp.display(), target.display())
+    })?;
 
     Ok(data.len())
 }
@@ -185,6 +203,7 @@ fn atomic_write(target: &Path, tmp: &Path, data: &[u8]) -> anyhow::Result<usize>
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     // 全局 PROJECT_ROOT 跨测试共享,并发跑会互相干扰,用 Mutex 序列化
@@ -213,7 +232,8 @@ mod tests {
         let args = serde_json::json!({
             "path": path,
             "content": "hello"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await.unwrap();
         assert!(res.contains("新建"), "应提示新建: {res}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
@@ -229,11 +249,15 @@ mod tests {
         let args = serde_json::json!({
             "path": path,
             "content": "new"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "无 overwrite 应拒绝");
         // 原内容应保留
-        assert_eq!(fs::read_to_string(dir.join("existing.txt")).unwrap(), "old content");
+        assert_eq!(
+            fs::read_to_string(dir.join("existing.txt")).unwrap(),
+            "old content"
+        );
         cleanup(&dir);
     }
 
@@ -247,7 +271,8 @@ mod tests {
             "path": path,
             "content": "new content",
             "overwrite": true
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await.unwrap();
         assert!(res.contains("覆盖"), "应提示覆盖: {res}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
@@ -262,7 +287,8 @@ mod tests {
         let args = serde_json::json!({
             "path": "/etc/passwd",
             "content": "hacked"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "项目外应拒绝");
         let msg = res.unwrap_err().to_string();
@@ -282,7 +308,8 @@ mod tests {
             "path": subdir,
             "content": "hello",
             "overwrite": true
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "目录应拒绝");
         let msg = res.unwrap_err().to_string();
@@ -299,7 +326,8 @@ mod tests {
         let args = serde_json::json!({
             "path": path,
             "content": "hacked"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), ".git 应拒绝");
         let msg = res.unwrap_err().to_string();
@@ -316,7 +344,8 @@ mod tests {
         let args = serde_json::json!({
             "path": path,
             "content": "hello"
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "父目录不存在应拒绝");
         cleanup(&dir);
@@ -337,11 +366,17 @@ mod tests {
             "path": path,
             "content": "new",
             "overwrite": true
-        }).to_string();
+        })
+        .to_string();
         tool.execute(&args).await.unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "权限应保留 0600,实际 {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "权限应保留 0600,实际 {:o}",
+            mode & 0o777
+        );
         cleanup(&dir);
     }
 
@@ -355,7 +390,8 @@ mod tests {
         let args = serde_json::json!({
             "path": path,
             "content": big
-        }).to_string();
+        })
+        .to_string();
         let res = tool.execute(&args).await;
         assert!(res.is_err(), "超大内容应拒绝");
         let msg = res.unwrap_err().to_string();

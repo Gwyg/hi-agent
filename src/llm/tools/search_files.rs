@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use super::Tool;
@@ -254,6 +254,7 @@ fn truncate_line(line: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     fn setup_test_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
