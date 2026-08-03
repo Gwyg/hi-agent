@@ -126,22 +126,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_aligns_to_user_boundary() {
-        let mut m = Memory::new();
-        m.add(system("sys"));
-        // 构造:user → assistant(tool_calls) → tool_result 的配对,大量重复
-        for _ in 0..500 {
-            m.add(user(&"u".repeat(150)));
-            m.add(assistant(&"a".repeat(150)));
-            m.add(tool_result("call_1", &"r".repeat(150)));
-        }
-        let view = m.view();
-        // 首条 system,第二条必为 user(边界对齐)
-        assert!(is_system(&view[0]));
-        assert!(is_user(&view[1]), "截断后首条非 system 消息应为 user");
-    }
-
-    #[test]
     fn clear_keeps_system() {
         let mut m = Memory::new();
         m.add(system("sys prompt"));

@@ -1,68 +1,57 @@
 # hi-agent 配置文件
-# sandbox 控制路径边界,permissions 控制工具操作策略
+#
+# 重要的安全默认已内置到程序中:本文件可以整份删除,agent 仍能正常且安全地运行。
+# 下面所有配置项默认都被注释掉;需要时取消对应行的注释并修改即可。
+#
+# 配置来源优先级(高 → 低):
+#   环境变量 > 项目级 <项目>/.hi-agent/config.toml > 用户级 ~/.hi-agent/config.toml > 内置默认
 
-[sandbox]
-# 额外白名单(项目根由 cwd 自动推断,不在此配置)
-# 路径支持 ~ 展开
-extra_allowed = [
-    "~/.hi-agent",
-    "~/.config/hi-agent",
-]
-# 额外敏感后缀(ends_with 匹配,小写),追加到内置清单之上,只能加不能减
-# 内置清单:
-#   家目录凭证目录(starts_with):~/.ssh ~/.aws ~/.kube ~/.gnupg ~/.config/gcloud
-#   后缀(ends_with):.env .envrc .pem .key .p12 .pfx .npmrc .pypirc .netrc
-#                   .bash_history .zsh_history id_rsa id_ed25519 secrets.yml/yaml/json
-# 如 ["id_ecdsa", "id_dsa"]
-sensitive_suffixes = []
 
-# 额外敏感路径前缀(starts_with 匹配,运行时展开 ~),追加到内置清单之上
-# 如 ["~/.config/hi-agent", "/etc/myapp/secrets"]
-sensitive_paths = []
+# ============================================================
+# 大模型
+# ============================================================
+# 也可用环境变量覆盖(优先级最高):MODEL / BASE_URL / API_KEY。
+# api_key 建议放环境变量或 .env;若写在本文件,项目级配置务必加入 .gitignore。
+#
+# [llm]
+# model    = "deepseek-v4-pro"              # 默认 deepseek-v4-pro
+# base_url = "https://api.deepseek.com"     # 默认 DeepSeek 端点
+# api_key  = "sk-..."                       # 默认空,通常用环境变量提供
 
-# 权限规则:同工具按声明顺序匹配,先匹配先生效
-# 值格式:
-#   "deny"                 拒绝
-#   "allow"                直接执行
-#   { ask = true }         询问一次,本次会话内不再问
-#   { ask = false }        每次都问
-[permissions.bash]
-"rm -rf /" = "deny"
-"rm -rf ~" = "deny"
-"rm -rf *" = "deny"
-"dd if=* of=/dev/*" = "deny"
-"mkfs*" = "deny"
-":(){:|:&};:" = "deny"
-"rm *" = { ask = false }
-"sudo *" = { ask = false }
-"git push --force *" = { ask = false }
-"git reset --hard" = { ask = false }
-"npm publish" = { ask = false }
-"git push *" = { ask = true }
-"npm install *" = { ask = true }
-"cargo build" = "allow"
-"cargo test" = "allow"
-"cargo check" = "allow"
-"git status" = "allow"
-"git log" = "allow"
-"git diff" = "allow"
-"ls *" = "allow"
-"cat *" = "allow"
-"pwd" = "allow"
-"echo *" = "allow"
 
-[permissions.write]
-"*.env" = { ask = false }
-"*.pem" = { ask = false }
-"*.key" = { ask = false }
-"*id_rsa*" = { ask = false }
-"*id_ed25519*" = { ask = false }
-"*" = { ask = true }
+# ============================================================
+# 沙箱:文件读写边界
+# ============================================================
+# [sandbox]
+#
+# 【可写目录】agent 默认只能修改「当前项目目录」内的文件(约束 write/edit 工具)。
+# 默认已含:临时目录、~/.hi-agent。想让它写项目外的目录时在此追加(支持 ~ 展开):
+# write_allowed_paths = ["~/output", "/data/shared"]
+#
+# 【读取需确认 - 按后缀】read 工具读取这些后缀的文件前会先征求你同意(防泄露密钥)。
+# 内置已含 .env .pem .key .p12 .pfx .npmrc .pypirc .netrc .bash_history
+#          .zsh_history id_rsa id_ed25519 secrets.yml/yaml/json;此处仅做「追加」:
+# read_confirm_suffixes = [".mykey", ".db"]
+#
+# 【读取需确认 - 按路径】read 工具读取这些路径前缀下的文件前会先征求你同意。
+# 内置已含 ~/.ssh ~/.aws ~/.kube ~/.gnupg ~/.config/gcloud;此处仅做「追加」:
+# read_confirm_paths = ["/etc/myapp/secrets"]
 
-[permissions.edit]
-"*.env" = { ask = false }
-"*.pem" = { ask = false }
-"*.key" = { ask = false }
-"*id_rsa*" = { ask = false }
-"*id_ed25519*" = { ask = false }
-"*" = { ask = true }
+
+# ============================================================
+# 权限:bash 命令策略
+# ============================================================
+# 说明:
+#   - 致命命令(rm -rf /、dd 覆盖块设备、mkfs、fork 炸弹)由内置引擎强制拒绝,无法在此覆盖。
+#   - 危险命令(sudo / rm / git push --force / git reset --hard / npm publish)内置默认为
+#     「询问一次」;此处可覆盖(文件优先),或加严为「每次都问」。
+#   - 常见只读命令(ls / cat / git status / log / diff 等)内置已放行。
+#
+# 规则按声明顺序匹配,先命中先生效;复合命令(a && b)按其中最危险的子命令判定。
+# 取值共四种,各举一例:
+#
+# [permissions.bash]
+# "cargo build" = "allow"          # allow    :直接执行(放行你信任的项目命令)
+# "git push *"  = { ask = true }   # ask=true :询问一次,本次会话内记住
+# "sudo *"      = { ask = false }  # ask=false:每次都问(比内置默认更严)
+# "curl * | sh" = "deny"           # deny     :直接拒绝

@@ -2,6 +2,13 @@
 name = "hi-agent"
 version = "0.1.0"
 edition = "2024"
+description = "hi - a terminal AI coding agent"
+license = "MIT"
+repository = "https://github.com/Gwyg/hi-agent"
+
+[[bin]]
+name = "hi"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -16,6 +23,7 @@ ignore = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 ratatui = "0.29"
 regex = "1"
+self-replace = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { version = "0.8", features = ["preserve_order"] }
@@ -30,3 +38,8 @@ tree-sitter-bash = "0.23"
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.29", features = ["fs"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -59,16 +59,18 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// `tool_defs` 来自 Toolbox::definitions(),client 不持工具对象,只管 schema
+    /// model/base_url 经 config 分层解析(env > 项目 > 用户 > 默认);api_key 仅走 env
+    /// config 未初始化(测试)时用默认 LlmConfig,行为退回内置默认
     pub fn new(tool_defs: Vec<ChatCompletionTools>) -> Self {
+        let llm = crate::config::get()
+            .map(|c| c.llm)
+            .unwrap_or_default();
         let config = OpenAIConfig::new()
-            .with_api_key(std::env::var("API_KEY").unwrap_or_default())
-            .with_api_base(
-                std::env::var("BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            );
+            .with_api_key(llm.api_key())
+            .with_api_base(llm.base_url());
         Self {
             inner: Client::with_config(config),
-            model: std::env::var("MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            model: llm.model(),
             tool_defs,
         }
     }

@@ -1,11 +1,17 @@
+mod components;
 mod event;
+mod pages;
+mod text;
+mod theme;
 mod ui;
 
-use crate::agent::{Engine, EngineEvent};
+use crate::agent::{AskReply, Engine, EngineEvent};
 use crate::llm::tools::sandbox;
 use crate::llm::{LlmClient, Toolbox};
 use crossterm::{
-    event::{EventStream, KeyEvent},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, EventStream, KeyEvent,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -54,33 +60,71 @@ pub struct ToolCallInfo {
     pub status: ToolStatus,
 }
 
-/// 对话消息
+/// 消息内容块:按到达顺序交错存放文本与工具调用
+/// 保留时序,避免"文本全在前、工具卡片全在后"导致卡片被后续文本顶下去
+#[derive(Clone)]
+pub enum Block {
+    Text(String),
+    Tool(ToolCallInfo),
+}
+
+/// 对话消息:blocks 按到达顺序记录文本段与工具卡片
 #[derive(Clone)]
 pub struct Message {
     pub role: Role,
-    pub content: String,
+    pub blocks: Vec<Block>,
     pub status: MsgStatus,
-    pub tool_calls: Vec<ToolCallInfo>,
+    /// 本轮是否在等模型回复(等首 token):true 显示 Thinking
+    /// 事件驱动:新建/工具结束时置 true,首 token/ToolStart/Done/Error 置 false
+    pub awaiting_model: bool,
 }
 
 impl Message {
     pub fn user(content: String) -> Self {
         Self {
             role: Role::User,
-            content,
+            blocks: vec![Block::Text(content)],
             status: MsgStatus::Completed,
-            tool_calls: Vec::new(),
+            awaiting_model: false,
         }
     }
 
-    /// 占位 assistant 消息(Thinking 状态),后续事件追加 content/tool_calls
+    /// 占位 assistant 消息(Thinking 状态),后续事件按序追加 Text/Tool 块
     pub fn assistant_thinking() -> Self {
         Self {
             role: Role::Assistant,
-            content: String::new(),
+            blocks: Vec::new(),
             status: MsgStatus::Thinking,
-            tool_calls: Vec::new(),
+            awaiting_model: true,
         }
+    }
+
+    /// 追加文本增量:末块是 Text 则拼接,否则新开一个 Text 块(保留工具后的文本时序)
+    pub fn push_token(&mut self, token: &str) {
+        match self.blocks.last_mut() {
+            Some(Block::Text(s)) => s.push_str(token),
+            _ => self.blocks.push(Block::Text(token.to_string())),
+        }
+    }
+
+    /// 是否含任一工具块(状态栏判断"工具调用中"用)
+    pub fn has_tool(&self) -> bool {
+        self.blocks.iter().any(|b| matches!(b, Block::Tool(_)))
+    }
+
+    /// 是否有工具处于 Running(决定显示工具动画而非 Thinking)
+    pub fn has_running_tool(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| matches!(b, Block::Tool(tc) if tc.status == ToolStatus::Running))
+    }
+
+    /// 是否无任何文本内容(Thinking 占位判断用)
+    pub fn text_is_empty(&self) -> bool {
+        !self
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::Text(t) if !t.is_empty()))
     }
 }
 
@@ -104,6 +148,33 @@ pub struct Cursor {
 impl Cursor {
     pub fn origin() -> Self {
         Self { line: 0, column: 0 }
+    }
+}
+
+/// 待确认的工具调用(Action::Ask):存下后端的 reply 通道,等用户按键回传
+pub struct PendingAsk {
+    #[allow(dead_code)]
+    pub id: String,
+    pub prompt: String,
+    pub persistable: bool,
+    /// 当前高亮选项索引:0=允许,(persistable 时)1=总是允许,末位=拒绝
+    pub selected: usize,
+    pub reply: tokio::sync::oneshot::Sender<AskReply>,
+}
+
+impl PendingAsk {
+    /// 选项数:persistable 时 3(允许/总是允许/拒绝),否则 2(允许/拒绝)
+    pub fn option_count(&self) -> usize {
+        if self.persistable { 3 } else { 2 }
+    }
+
+    /// 当前高亮项对应的回答:0→One;persistable 时 1→Always;末位→Deny
+    pub fn reply_for_selected(&self) -> AskReply {
+        match self.selected {
+            0 => AskReply::One,
+            1 if self.persistable => AskReply::Always,
+            _ => AskReply::Deny,
+        }
     }
 }
 
@@ -132,6 +203,8 @@ pub struct App {
     pub cursor_visible: bool,
     /// 闪烁计数(每 tick 累加,每 4 tick 翻转 ≈ 480ms)
     pub blink_tick: u8,
+    /// 待用户确认的工具调用(Action::Ask);Some 时输入框上方显示确认条并拦截按键
+    pub pending_ask: Option<PendingAsk>,
 }
 
 impl App {
@@ -150,6 +223,7 @@ impl App {
             auto_scroll: true,
             cursor_visible: true,
             blink_tick: 0,
+            pending_ask: None,
         }
     }
 
@@ -180,28 +254,35 @@ impl App {
             EngineEvent::TokenDelta(token) => {
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == Role::Assistant {
-                        last.content.push_str(&token);
+                        last.push_token(&token);
                         last.status = MsgStatus::Streaming;
+                        last.awaiting_model = false; // 首 token 到,模型已在回复
                     }
                 }
             }
             EngineEvent::ToolStart { id, name, args } => {
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == Role::Assistant {
-                        last.tool_calls.push(ToolCallInfo {
+                        last.awaiting_model = false; // 转工具动画,由卡片自己转
+                        last.blocks.push(Block::Tool(ToolCallInfo {
                             id,
                             name,
                             args,
                             status: ToolStatus::Running,
-                        });
+                        }));
                     }
                 }
             }
             EngineEvent::ToolResult { id, .. } => {
                 if let Some(last) = self.messages.last_mut() {
-                    if let Some(tc) = last.tool_calls.iter_mut().find(|t| t.id == id) {
+                    if let Some(tc) = last.blocks.iter_mut().find_map(|b| match b {
+                        Block::Tool(tc) if tc.id == id => Some(tc),
+                        _ => None,
+                    }) {
                         tc.status = ToolStatus::Done;
                     }
+                    // 工具结束,又开始等下一轮模型(渲染层再用 has_running_tool 兜底多工具场景)
+                    last.awaiting_model = true;
                 }
             }
             EngineEvent::Done(_) => {
@@ -209,6 +290,7 @@ impl App {
                     if last.role == Role::Assistant && last.status != MsgStatus::Error {
                         last.status = MsgStatus::Completed;
                     }
+                    last.awaiting_model = false;
                 }
                 self.mode = Mode::Input;
                 self.thinking_since = None;
@@ -216,17 +298,31 @@ impl App {
             EngineEvent::Error(msg) => {
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == Role::Assistant {
-                        if last.content.is_empty() {
-                            last.content = msg;
+                        if last.text_is_empty() {
+                            last.blocks.push(Block::Text(msg));
                         }
                         last.status = MsgStatus::Error;
                     }
+                    last.awaiting_model = false;
                 }
                 self.mode = Mode::Input;
                 self.thinking_since = None;
             }
-            // Ask 暂不处理交互确认:reply drop → agent_loop fallback 暂拒
-            EngineEvent::Ask { .. } | EngineEvent::ToolOutputDelta { .. } => {}
+            EngineEvent::Ask {
+                id,
+                prompt,
+                persistable,
+                reply,
+            } => {
+                self.pending_ask = Some(PendingAsk {
+                    id,
+                    prompt,
+                    persistable,
+                    selected: 0, // 默认高亮"允许"
+                    reply,
+                });
+            }
+            EngineEvent::ToolOutputDelta { .. } => {}
         }
     }
 
@@ -301,25 +397,25 @@ impl App {
 
     pub fn cursor_up(&mut self) {
         let width = self.input_width;
-        let (cur_vi, cur_vcol) = ui::cursor_visual_pos(&self.buffer, self.cursor, width);
+        let (cur_vi, cur_vcol) = text::cursor_visual_pos(&self.buffer, self.cursor, width);
         if cur_vi == 0 {
             return;
         }
-        let visual = ui::visual_lines(&self.buffer, width);
-        let cur_x = ui::visual_x_of(&visual[cur_vi], cur_vcol);
-        let (line, column) = ui::visual_to_buffer(&self.buffer, width, cur_vi - 1, cur_x);
+        let visual = text::visual_lines(&self.buffer, width);
+        let cur_x = text::visual_x_of(&visual[cur_vi], cur_vcol);
+        let (line, column) = text::visual_to_buffer(&self.buffer, width, cur_vi - 1, cur_x);
         self.cursor = Cursor { line, column };
     }
 
     pub fn cursor_down(&mut self) {
         let width = self.input_width;
-        let (cur_vi, cur_vcol) = ui::cursor_visual_pos(&self.buffer, self.cursor, width);
-        let visual = ui::visual_lines(&self.buffer, width);
+        let (cur_vi, cur_vcol) = text::cursor_visual_pos(&self.buffer, self.cursor, width);
+        let visual = text::visual_lines(&self.buffer, width);
         if cur_vi + 1 >= visual.len() {
             return;
         }
-        let cur_x = ui::visual_x_of(&visual[cur_vi], cur_vcol);
-        let (line, column) = ui::visual_to_buffer(&self.buffer, width, cur_vi + 1, cur_x);
+        let cur_x = text::visual_x_of(&visual[cur_vi], cur_vcol);
+        let (line, column) = text::visual_to_buffer(&self.buffer, width, cur_vi + 1, cur_x);
         self.cursor = Cursor { line, column };
     }
 }
@@ -332,7 +428,9 @@ impl App {
 /// TUI 主循环 select 键盘事件 + agent 事件流 + spinner tick
 pub async fn run() -> anyhow::Result<()> {
     let toolbox = Toolbox::new();
-    let model_name = std::env::var("MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model_name = crate::config::get()
+        .map(|c| c.llm.model())
+        .unwrap_or_else(|_| "deepseek-chat".to_string());
     let client = LlmClient::new(toolbox.definitions());
     let mut engine = Engine::new(client, toolbox);
 
@@ -352,7 +450,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -367,6 +465,7 @@ pub async fn run() -> anyhow::Result<()> {
 
         match event::next_event(&mut events, &mut event_rx, &mut tick).await {
             event::Event::Key(key) => handle_key(&mut app, key, &input_tx).await,
+            event::Event::Mouse(m) => handle_mouse(&mut app, m),
             event::Event::Engine(ev) => app.handle_engine_event(ev),
             event::Event::Tick => {
                 app.frame = (app.frame + 1) % 6;
@@ -381,13 +480,64 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
 
     Ok(())
 }
 
+/// 滚轮滚动消息列表:上滚上翻(禁用跟随),下滚下翻(接近底部时渲染层恢复跟随)
+fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
+    use crossterm::event::MouseEventKind;
+    match m.kind {
+        MouseEventKind::ScrollUp => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
+        }
+        _ => {}
+    }
+}
+
 async fn handle_key(app: &mut App, key: KeyEvent, input_tx: &mpsc::Sender<String>) {
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Ctrl+C / Ctrl+D 始终可退出(即便有待确认项)
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        app.mode = Mode::Quit;
+        return;
+    }
+
+    // 有待确认工具时,拦截按键做选择确认:←/→/Tab 移动高亮,Enter 确认,Esc 拒绝
+    if let Some(mut pending) = app.pending_ask.take() {
+        match key.code {
+            KeyCode::Left => {
+                pending.selected = pending.selected.saturating_sub(1);
+                app.pending_ask = Some(pending);
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                pending.selected = (pending.selected + 1).min(pending.option_count() - 1);
+                app.pending_ask = Some(pending);
+            }
+            KeyCode::Enter => {
+                let ans = pending.reply_for_selected();
+                let _ = pending.reply.send(ans);
+            }
+            KeyCode::Esc => {
+                let _ = pending.reply.send(AskReply::Deny);
+            }
+            // 其他键忽略:放回,继续等待
+            _ => app.pending_ask = Some(pending),
+        }
+        return;
+    }
 
     match (key.modifiers, key.code) {
         (m, KeyCode::Char('c')) | (m, KeyCode::Char('d')) if m.contains(KeyModifiers::CONTROL) => {

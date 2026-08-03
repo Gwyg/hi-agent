@@ -81,7 +81,7 @@ const UNSAFE_FIND_OPTS: &[&str] = &[
 /// base64 不安全选项(写文件)
 const UNSAFE_BASE64_OPTS: &[&str] = &["-o", "--output"];
 
-/// 线程局部解析器(Parser 非线程安全,thread_local 避免重复初始化)
+// 线程局部解析器(Parser 非线程安全,thread_local 避免重复初始化)
 thread_local! {
     static PARSER: std::cell::RefCell<Parser> = {
         let mut p = Parser::new();

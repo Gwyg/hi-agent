@@ -5,47 +5,14 @@ use std::sync::RwLock;
 static PROJECT_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// 全局额外白名单(启动时 set,会话内不变)
-/// 默认覆盖:临时文件、agent 配置、工具配置、缓存、数据
+/// 最终清单(默认基线 + 文件追加)由 config 层算好后传入,本层不持默认
 static EXTRA_ALLOWED: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
-/// 合并后的敏感后缀清单(内置 + 配置追加,启动时 set,会话内不变)
-/// 内置基线始终在前,配置只能追加不能移除内置项(安全原则:收紧可,放宽不可)
+/// 敏感后缀清单(config 层已合并内置基线 + 文件追加,启动时 set,会话内不变)
 static SENSITIVE_SUFFIXES: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
-/// 合并后的敏感路径前缀清单(内置 + 配置追加,启动时已展开 ~,会话内不变)
-/// 内置基线始终在前,配置只能追加不能移除内置项
+/// 敏感路径前缀清单(config 层已合并,本层负责展开 ~,启动时 set,会话内不变)
 static SENSITIVE_PATHS: RwLock<Vec<String>> = RwLock::new(Vec::new());
-
-/// 内置敏感后缀基线(ends_with 匹配,小写;启动时合并到 SENSITIVE_SUFFIXES)
-const BUILTIN_SUFFIXES: &[&str] = &[
-    ".env",          // 环境变量(API keys, DB URLs)
-    ".envrc",        // direnv
-    ".pem",          // 证书/私钥
-    ".key",          // 私钥
-    ".p12",          // 证书
-    ".pfx",          // 证书
-    ".npmrc",        // npm token
-    ".pypirc",       // PyPI token
-    ".netrc",        // HTTP 凭证
-    ".bash_history", // shell 历史
-    ".zsh_history",  // shell 历史
-    "id_rsa",        // SSH 私钥(ends_with: id_rsa,不匹配 id_rsa.pub 因为公钥不敏感)
-    "id_ed25519",    // SSH 私钥(同上)
-    "secrets.yml",   // 通用密钥文件
-    "secrets.yaml",
-    "secrets.json",
-];
-
-/// 内置敏感路径前缀基线(starts_with 匹配,启动时展开 ~)
-/// 只匹配家目录下的凭证目录,不影响项目内或其他位置的同名目录
-/// 参考 Codex 的 OS 沙箱精确路径 denyRead
-const BUILTIN_PATH_PREFIXES: &[&str] = &[
-    "~/.ssh",           // SSH 密钥
-    "~/.aws",           // AWS 凭证
-    "~/.kube",          // K8s 配置
-    "~/.gnupg",         // GPG 密钥
-    "~/.config/gcloud", // GCP 凭证
-];
 
 /// 初始化/切换项目根
 /// - CLI:main 启动时调一次(env 优先,current_dir 兜底)
@@ -87,10 +54,9 @@ pub fn set_extra_allowed(paths: Vec<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 默认额外白名单:只含临时目录
-/// 其他路径(配置/缓存/数据目录)路径约定跨平台争议大(Apple vs XDG vs Windows),
-/// 不内置,需写项目外配置等用 bash 显式操作
-/// main 启动时调,传给 set_extra_allowed
+/// 测试用最小白名单:仅临时目录
+/// 生产默认(temp + ~/.hi-agent + 文件追加)由 config::sandbox 层组装,不在本逻辑层
+#[cfg(test)]
 pub fn default_extra_paths() -> Vec<PathBuf> {
     vec![std::env::temp_dir()]
 }
@@ -98,12 +64,11 @@ pub fn default_extra_paths() -> Vec<PathBuf> {
 /// 设置敏感后缀清单:内置 + 配置追加(启动时调)
 /// 内置基线始终在前,配置只能追加不能移除内置项
 /// 全部用 ends_with 匹配,归一化后存入 SENSITIVE_SUFFIXES
-pub fn set_sensitive_suffixes(extra: &[String]) -> anyhow::Result<()> {
-    let mut all: Vec<String> = BUILTIN_SUFFIXES
-        .iter()
-        .map(|s| normalize_for_match(s))
-        .collect();
-    all.extend(extra.iter().map(|s| normalize_for_match(s)));
+/// 设置敏感后缀清单(启动时调)
+/// 入参为 config 层已合并(内置基线 + 文件追加)的完整清单;本层只做归一化后存入
+/// 全部用 ends_with 匹配
+pub fn set_sensitive_suffixes(list: &[String]) -> anyhow::Result<()> {
+    let all: Vec<String> = list.iter().map(|s| normalize_for_match(s)).collect();
     let mut guard = SENSITIVE_SUFFIXES
         .write()
         .map_err(|e| anyhow::anyhow!("sensitive_suffixes 锁中毒: {e}"))?;
@@ -114,19 +79,17 @@ pub fn set_sensitive_suffixes(extra: &[String]) -> anyhow::Result<()> {
 /// 设置敏感路径前缀清单:内置 + 配置追加(启动时调)
 /// 启动时预展开 ~ 成绝对路径,运行时只 starts_with,无 replacen alloc
 /// 内置基线始终在前,配置只能追加不能移除内置项
-pub fn set_sensitive_paths(extra: &[String]) -> anyhow::Result<()> {
+/// 设置敏感路径前缀清单(启动时调)
+/// 入参为 config 层已合并(内置基线 + 文件追加)的完整清单;本层展开 ~ 成绝对路径
+/// 预展开后运行时只 starts_with,无 replacen alloc
+pub fn set_sensitive_paths(list: &[String]) -> anyhow::Result<()> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取家目录,无法展开敏感路径前缀"))?;
     let home_str = normalize_for_match(&home.to_string_lossy());
-    let mut all: Vec<String> = BUILTIN_PATH_PREFIXES
+    let all: Vec<String> = list
         .iter()
-        .map(|p| p.replacen('~', &home_str, 1))
+        .map(|p| normalize_for_match(p).replacen('~', &home_str, 1))
         .collect();
-    all.extend(
-        extra
-            .iter()
-            .map(|p| normalize_for_match(p).replacen('~', &home_str, 1)),
-    );
     let mut guard = SENSITIVE_PATHS
         .write()
         .map_err(|e| anyhow::anyhow!("sensitive_paths 锁中毒: {e}"))?;
