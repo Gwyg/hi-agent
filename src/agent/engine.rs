@@ -49,14 +49,5 @@ fn build_system_prompt() -> String {
     let root = crate::llm::tools::sandbox::project_root()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "未知".to_string());
-    format!(
-        "你是 hi-agent,一个编程助手。\n\n\
-         工作目录:{root}\n\n\
-         行为准则:\n\
-         1. 优先用专用工具(read/write/edit/search_files),它们更安全。bash 是兜底,专用工具做不到时再用。\n\
-         2. 改文件前先 read 确认内容,避免误改。\n\
-         3. 简述意图和结果,不啰嗦。\n\
-         4. 不确定时询问用户,不擅自做有风险的操作。\n\
-         5. 回复用中文。"
-    )
+    include_str!("system_prompt.md").replace("%%ROOT%%", &root)
 }
