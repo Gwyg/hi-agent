@@ -2,11 +2,12 @@ use crate::llm::{
     ChatResponse, LlmClient, Toolbox, assistant, assistant_with_tool_calls, tool_result,
 };
 use async_openai::types::chat::ChatCompletionMessageToolCalls;
+use futures::{StreamExt, stream};
 use tokio::sync::{mpsc, oneshot};
 
 use super::memory::Memory;
 use super::{AskReply, EngineEvent};
-use crate::llm::tools::Action;
+use crate::llm::tools::{Action, Tool};
 
 /// agent 循环:chat ↔ 工具,直到模型给出最终回复(Stop)
 /// 通过 Memory 的 add/view 与记忆交互,压缩由 Memory 内部接管,本循环不感知
@@ -20,6 +21,8 @@ pub(crate) async fn agent_loop(
 ) -> anyhow::Result<()> {
     // 循环上限:防模型反复调工具无限循环(如工具一直失败、模型钻牛角尖)
     const MAX_TURNS: usize = 20;
+    // 并行执行上限:同时最多跑几个工具(read 有 spawn_blocking 同步 IO,防阻塞池打爆)
+    const MAX_CONCURRENT: usize = 6;
 
     for turn in 0..MAX_TURNS {
         // view 内部:等待进行中的压缩、组装压缩视图(硬截断兜底)
@@ -52,8 +55,13 @@ pub(crate) async fn agent_loop(
                     client,
                 );
 
-                // 逐个执行工具调用
-                for call in &tool_calls {
+                // 预解析 + 预检:拆成两组——Allow 组并发执行,Ask/Deny 组串行
+                // (单确认条 UI,Ask 需逐个问);未知/custom 当场记错误,不参与执行。
+                // 结果最终统一按原顺序回灌,模型视角与串行一致。
+                let total = tool_calls.len();
+                let mut parallel: Vec<(usize, String, String, String, &dyn Tool)> = Vec::new();
+                let mut serial: Vec<(usize, String, String, String)> = Vec::new();
+                for (idx, call) in tool_calls.iter().enumerate() {
                     let (id, name, args) = match call {
                         ChatCompletionMessageToolCalls::Function(f) => (
                             f.id.clone(),
@@ -61,17 +69,79 @@ pub(crate) async fn agent_loop(
                             f.function.arguments.clone(),
                         ),
                         ChatCompletionMessageToolCalls::Custom(c) => {
-                            // custom tool 目前不支持,统一拒
                             memory.add(tool_result(&c.id, "不支持 custom tool 调用"));
                             continue;
                         }
                     };
+                    match toolbox.find(&name) {
+                        None => {
+                            memory.add(tool_result(&id, &format!("未知工具: {name}")));
+                            continue;
+                        }
+                        Some(tool) => match tool.assess(&args) {
+                            Action::Allow => parallel.push((idx, id, name, args, tool)),
+                            // Ask/Deny 走 handle_tool_call(内部含授权检查/Ask 询问/Deny 拒绝)
+                            _ => serial.push((idx, id, name, args)),
+                        },
+                    }
+                }
+                tracing::info!(
+                    turn,
+                    parallel = parallel.len(),
+                    serial = serial.len(),
+                    "工具调用:并行组 + 串行组混合执行"
+                );
 
-                    // 执行单个工具调用(含预检/授权/询问),统一拿回 content
-                    let content = match handle_tool_call(toolbox, &emit, &id, &name, &args).await {
+                // 并行组:先全部发 ToolStart,再并发执行
+                for (_, id, name, args, _) in &parallel {
+                    let _ = emit
+                        .send(EngineEvent::ToolStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        })
+                        .await;
+                }
+                let futures: Vec<_> = parallel
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, _, _, args, tool))| {
+                        let args = args.clone();
+                        async move {
+                            // 返回 (组内下标, 结果):buffer_unordered 按完成顺序返回,需用下标归位
+                            let content = match tool.execute(&args).await {
+                                Ok(s) => s,
+                                Err(e) => format!("工具执行出错: {e}"),
+                            };
+                            (i, content)
+                        }
+                    })
+                    .collect();
+                // 并发限流:同时最多 MAX_CONCURRENT 个工具执行(防阻塞池/子进程被打爆)
+                let results: Vec<_> =
+                    stream::iter(futures).buffer_unordered(MAX_CONCURRENT).collect().await;
+
+                // 串行组:逐个执行(handle_tool_call 内部 emit ToolStart + Ask 询问)
+                let mut serial_results: Vec<(usize, String, String)> = Vec::new();
+                for (idx, id, name, args) in &serial {
+                    let content = match handle_tool_call(toolbox, &emit, id, name, args).await {
                         Ok(s) => s,
                         Err(e) => format!("工具执行出错: {e}"),
                     };
+                    serial_results.push((*idx, id.clone(), content));
+                }
+
+                // 按原顺序合并回灌:memory + ToolResult 事件
+                let mut ordered: Vec<Option<(String, String)>> = vec![None; total];
+                for (i, content) in results {
+                    let (idx, id, _, _, _) = &parallel[i];
+                    ordered[*idx] = Some((id.clone(), content));
+                }
+                for (idx, id, content) in serial_results {
+                    ordered[idx] = Some((id, content));
+                }
+                for entry in ordered.into_iter().flatten() {
+                    let (id, content) = entry;
                     memory.add(tool_result(&id, &content));
                     let _ = emit
                         .send(EngineEvent::ToolResult {

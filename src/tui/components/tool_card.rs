@@ -16,7 +16,11 @@ pub(crate) fn tool_card_line(tc: &ToolCallInfo, frame: u8) -> Line<'static> {
         "bash" => "$",
         _ => "●",
     };
-    let target = extract_target(&tc.args);
+    let target = if tc.name == "read" {
+        extract_read_target(&tc.args)
+    } else {
+        extract_target(&tc.args)
+    };
     let (status_text, status_color) = match tc.status {
         ToolStatus::Running => {
             let spinner = SPINNER[frame as usize];
@@ -45,4 +49,24 @@ fn extract_target(args: &str) -> String {
         }
     }
     args.to_string()
+}
+
+/// read 工具:path 后附带 offset/limit(存在才显示),如 `src/main.rs [offset=70, limit=20]`
+fn extract_read_target(args: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return extract_target(args);
+    };
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .unwrap_or("(无 path)")
+        .to_string();
+    let offset = v.get("offset").and_then(|x| x.as_u64());
+    let limit = v.get("limit").and_then(|x| x.as_u64());
+    match (offset, limit) {
+        (Some(o), Some(l)) => format!("{path} [offset={o}, limit={l}]"),
+        (Some(o), None) => format!("{path} [offset={o}]"),
+        (None, Some(l)) => format!("{path} [limit={l}]"),
+        (None, None) => path,
+    }
 }

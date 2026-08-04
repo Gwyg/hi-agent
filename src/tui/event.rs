@@ -11,6 +11,8 @@ pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Engine(EngineEvent),
+    /// 终端重新获得焦点(Windows 失焦回焦可能重置 console mode,需重设鼠标捕获)
+    FocusGained,
     /// spinner 动画 tick
     Tick,
     Quit,
@@ -32,7 +34,8 @@ pub async fn next_event(
                     return Event::Key(key);
                 }
                 Some(Ok(CtEvent::Mouse(m))) => return Event::Mouse(m),
-                Some(Ok(_)) => continue,  // 忽略 Resize/Release/Repeat
+                Some(Ok(CtEvent::FocusGained)) => return Event::FocusGained,
+                Some(Ok(_)) => continue,  // 忽略 Resize/Release/Repeat/FocusLost
                 _ => return Event::Quit,
             },
             ev = event_rx.recv() => {

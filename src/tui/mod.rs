@@ -467,6 +467,11 @@ pub async fn run() -> anyhow::Result<()> {
             event::Event::Key(key) => handle_key(&mut app, key, &input_tx).await,
             event::Event::Mouse(m) => handle_mouse(&mut app, m),
             event::Event::Engine(ev) => app.handle_engine_event(ev),
+            event::Event::FocusGained => {
+                // Windows 失焦回焦可能重置 console mode 导致鼠标捕获丢失,
+                // 重新抢占鼠标,恢复 TUI 滚动/点击(不改 raw mode,避免闪烁)
+                let _ = execute!(io::stdout(), EnableMouseCapture);
+            }
             event::Event::Tick => {
                 app.frame = (app.frame + 1) % 6;
                 // 光标闪烁:每 4 tick(≈480ms)翻转
