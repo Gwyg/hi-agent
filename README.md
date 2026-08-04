@@ -88,7 +88,14 @@ extra_allowed = ["~/some/shared/dir"]
 "rm *" = { ask = true }
 ```
 
-日志写入 `~/.hi-agent/log/hi-agent.log`，不会污染工作目录。
+日志按天滚动写入 `~/.hi-agent/log/hi-agent.log.YYYY-MM-DD`，不会污染工作目录。启动时自动清理超过保留期的旧日志（默认 7 天，可配）：
+
+```toml
+[log]
+retention_days = 7   # 0 表示永不清理
+```
+
+也可用环境变量 `HI_AGENT_LOG_DIR` 自定义日志目录、`HI_AGENT_LOG_RETENTION_DAYS` 覆盖保留天数。日志级别默认 `info`，通过 `RUST_LOG` 调整（`debug`/`trace`/`warn`）。
 
 ## 从源码构建
 

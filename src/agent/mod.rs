@@ -1,6 +1,9 @@
 mod agent_loop;
 mod engine;
 mod memory;
+/// 持久化层:本期记忆未接入,保留供未来会话续接/落盘
+#[allow(dead_code)]
+pub mod persistence;
 
 use tokio::sync::oneshot;
 

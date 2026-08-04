@@ -7,10 +7,12 @@
 //! - config::SandboxConfig
 
 mod llm;
+mod log;
 mod permissions;
 mod sandbox;
 
 pub use llm::LlmConfig;
+pub use log::LogConfig;
 pub use permissions::{PermissionAction, PermissionsConfig, SimpleAction, config_match};
 pub use sandbox::SandboxConfig;
 
@@ -29,6 +31,8 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);

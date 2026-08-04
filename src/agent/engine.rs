@@ -1,4 +1,4 @@
-use crate::llm::{LlmClient, Toolbox, system, user};
+use crate::llm::{LlmClient, Toolbox, user};
 use tokio::sync::mpsc;
 
 use super::EngineEvent;
@@ -15,13 +15,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(client: LlmClient, toolbox: Toolbox) -> Self {
-        let mut memory = Memory::new();
-        // 注入系统提示词(首轮即生效,跨轮保留在 memory 头部)
-        memory.add(system(&build_system_prompt()));
+        // system prompt 由核心记忆层(Core)在 Memory::new 时自动加载
         Self {
             client,
             toolbox,
-            memory,
+            memory: Memory::new(),
         }
     }
 
@@ -38,16 +36,9 @@ impl Engine {
         user_input: &str,
         emit: mpsc::Sender<EngineEvent>,
     ) -> anyhow::Result<()> {
+        let input_preview: String = user_input.chars().take(200).collect();
+        tracing::info!(input_len = user_input.chars().count(), input = %input_preview, "用户输入,开始新一轮");
         self.memory.add(user(user_input));
         agent_loop(&self.client, &self.toolbox, &mut self.memory, emit).await
     }
-}
-
-/// 构造系统提示词:身份 + 工作目录 + 行为准则
-/// 工具详情不在此重复(模型从 tools schema 获取),只给高层准则
-fn build_system_prompt() -> String {
-    let root = crate::llm::tools::sandbox::project_root()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "未知".to_string());
-    include_str!("system_prompt.md").replace("%%ROOT%%", &root)
 }

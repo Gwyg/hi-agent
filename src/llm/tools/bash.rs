@@ -110,6 +110,10 @@ impl Tool for BashTool {
             None => project_root()?,
         };
 
+        // 命令摘要:防刷屏,截到 300 字符
+        let cmd_summary: String = args.command.chars().take(300).collect();
+        tracing::info!(command = %cmd_summary, cwd = %cwd.display(), timeout_secs, "bash 执行");
+
         let mut cmd = tokio::process::Command::new(SHELL);
         cmd.arg(SHELL_FLAG)
             .arg(&args.command)
@@ -119,21 +123,33 @@ impl Tool for BashTool {
             .kill_on_drop(true); // 超时/drop 时杀直接子进程(进程树 TODO:setsid+killpg/JobObject)
 
         let child = cmd.spawn().map_err(|e| {
+            tracing::warn!(command = %cmd_summary, "bash 启动失败: {e:#}");
             anyhow::anyhow!("启动命令失败(shell={SHELL},cwd={}): {e}", cwd.display())
         })?;
 
         // tokio::process 真异步,wait_with_output 让出 worker,不阻塞 runtime
         // 超时:timeout 返回后 child future 被 drop → kill_on_drop 杀进程
-        let output =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-                .map_err(|_| anyhow::anyhow!("命令超时(>{timeout_secs}s),进程已杀"))?
-                .map_err(|e| anyhow::anyhow!("命令执行失败: {e}"))?;
+        let output = match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(r) => r.map_err(|e| {
+                tracing::warn!(command = %cmd_summary, "bash 执行失败: {e:#}");
+                anyhow::anyhow!("命令执行失败: {e}")
+            })?,
+            Err(_) => {
+                tracing::warn!(command = %cmd_summary, timeout_secs, "bash 超时,进程已杀");
+                return Err(anyhow::anyhow!("命令超时(>{timeout_secs}s),进程已杀"));
+            }
+        };
 
         let exit_code = output.status.code().unwrap_or(-1);
         // lossy 解码(Windows cmd 可能非 UTF-8),normalize \r\n → \n,截断防刷屏
         let stdout = truncate(normalize(&output.stdout));
         let stderr = truncate(normalize(&output.stderr));
+        tracing::info!(command = %cmd_summary, exit_code, "bash 完成");
 
         Ok(format!(
             "exit_code: {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -151,6 +167,7 @@ fn truncate(s: String) -> String {
     if s.len() <= MAX_OUTPUT {
         return s;
     }
+    tracing::warn!(original_bytes = s.len(), limit = MAX_OUTPUT, "bash 输出被截断");
     // 从 MAX_OUTPUT 往前找最近的字符边界,避免切碎多字节字符
     let mut end = MAX_OUTPUT;
     while end > 0 && !s.is_char_boundary(end) {

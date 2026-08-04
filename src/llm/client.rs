@@ -4,7 +4,8 @@ use async_openai::{
     types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestMessage, ChatCompletionResponseMessage, ChatCompletionStreamOptions,
-        ChatCompletionTools, CreateChatCompletionRequestArgs, FinishReason, FunctionCall, Role,
+        ChatCompletionTools, CompletionUsage, CreateChatCompletionRequestArgs, FinishReason,
+        FunctionCall, Role,
     },
 };
 use futures::StreamExt;
@@ -50,6 +51,7 @@ fn classify(
     }
 }
 
+#[derive(Clone)]
 pub struct LlmClient {
     inner: Client<OpenAIConfig>,
     model: String,
@@ -75,31 +77,67 @@ impl LlmClient {
         }
     }
 
-    /// 非流式聊天(预留:当前 agent_loop 用 chat_stream)
+    /// 非流式聊天(预留:当前 agent_loop 用 chat_stream,压缩摘要将用它)
+    /// 返回 (响应分类, token 用量)。usage 为 None 表示接口未返回统计
     #[allow(dead_code)]
     pub async fn chat(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<(ChatResponse, Option<CompletionUsage>)> {
+        self.chat_inner(messages, true).await
+    }
+
+    /// 非流式聊天,不挂 tools schema。用于压缩摘要——摘要器无需工具,少喂一坨 schema 省 token。
+    pub async fn chat_no_tools(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+    ) -> anyhow::Result<(ChatResponse, Option<CompletionUsage>)> {
+        self.chat_inner(messages, false).await
+    }
+
+    /// 非流式聊天内核:with_tools 决定是否附带工具 schema
+    async fn chat_inner(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        with_tools: bool,
+    ) -> anyhow::Result<(ChatResponse, Option<CompletionUsage>)> {
+        let msg_count = messages.len();
+        tracing::info!(model = %self.model, msg_count, with_tools, "LLM 非流式请求");
         let mut builder = CreateChatCompletionRequestArgs::default();
         builder.model(&self.model).messages(messages);
-        if !self.tool_defs.is_empty() {
+        if with_tools && !self.tool_defs.is_empty() {
             builder.tools(self.tool_defs.clone());
         }
         let request = builder.build()?;
-        let mut response = self.inner.chat().create(request).await?;
+        let mut response = self.inner.chat().create(request).await.map_err(|e| {
+            tracing::error!("LLM 非流式请求失败: {e:#}");
+            anyhow::anyhow!("LLM 请求失败: {e}")
+        })?;
+        let usage = response.usage.take();
         let choice = response
             .choices
             .pop()
             .ok_or_else(|| anyhow::anyhow!("empty response"))?;
-        Ok(classify(choice.message, choice.finish_reason))
+        let finish_reason = choice.finish_reason;
+        let result = classify(choice.message, finish_reason);
+        tracing::info!(
+            model = %self.model,
+            msg_count,
+            finish = ?finish_reason,
+            prompt_tokens = usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+            completion_tokens = usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+            "LLM 非流式响应"
+        );
+        Ok((result, usage))
     }
 
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         on_token: impl Fn(&str),
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<(ChatResponse, Option<CompletionUsage>)> {
+        let msg_count = messages.len();
+        tracing::info!(model = %self.model, msg_count, "LLM 流式请求开始");
         let mut builder = CreateChatCompletionRequestArgs::default();
         builder
             .model(&self.model)
@@ -112,23 +150,25 @@ impl LlmClient {
             builder.tools(self.tool_defs.clone());
         }
         let request = builder.build()?;
-        let mut stream = self.inner.chat().create_stream(request).await?;
+        let mut stream = self.inner.chat().create_stream(request).await.map_err(|e| {
+            tracing::error!("LLM 流式请求建立失败: {e:#}");
+            anyhow::anyhow!("LLM 流式请求失败: {e}")
+        })?;
 
         let mut content = String::new();
         let mut refusal = String::new();
         let mut tool_calls_map: BTreeMap<u32, ToolCallAcc> = BTreeMap::new();
         let mut finish_reason: Option<FinishReason> = None;
+        let mut usage: Option<CompletionUsage> = None;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            // usage chunk(choices 为空)携带整次请求的 token 统计
-            if let Some(usage) = chunk.usage {
-                tracing::info!(
-                    prompt_tokens = usage.prompt_tokens,
-                    completion_tokens = usage.completion_tokens,
-                    total_tokens = usage.total_tokens,
-                    "chat_stream token usage"
-                );
+            let chunk = chunk.map_err(|e| {
+                tracing::warn!("LLM 流式 chunk 出错: {e:#}");
+                anyhow::anyhow!("LLM 流式出错: {e}")
+            })?;
+            // usage chunk(choices 为空)携带整次请求的 token 统计,单独最后到达
+            if let Some(u) = chunk.usage {
+                usage = Some(u);
             }
             for choice in chunk.choices {
                 // 文本内容增量
@@ -164,6 +204,11 @@ impl LlmClient {
             }
         }
 
+        if !refusal.is_empty() {
+            tracing::warn!(model = %self.model, refusal = %refusal, "LLM 返回安全拒绝");
+        }
+
+        let tool_call_count = tool_calls_map.len();
         let tool_calls = if tool_calls_map.is_empty() {
             None
         } else {
@@ -183,6 +228,7 @@ impl LlmClient {
             )
         };
 
+        let content_len = content.chars().count();
         let message = ChatCompletionResponseMessage {
             content: empty_to_none(content),
             tool_calls,
@@ -194,6 +240,16 @@ impl LlmClient {
             audio: None,
         };
 
-        Ok(classify(message, finish_reason))
+        tracing::info!(
+            model = %self.model,
+            finish = ?finish_reason,
+            content_len,
+            tool_call_count,
+            prompt_tokens = usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+            completion_tokens = usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+            "LLM 流式响应完成"
+        );
+
+        Ok((classify(message, finish_reason), usage))
     }
 }

@@ -4,7 +4,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
 };
 
-/// 构造 system 消息(系统提示,一般放消息列表最前)
+/// 构造 system 消息(系统提示,一般放消息列表最前)。
+/// 纯封装:一段文本 → System 消息。多段合并等业务归调用方(如 Core)。
 pub fn system(content: &str) -> ChatCompletionRequestMessage {
     ChatCompletionRequestMessage::System(
         ChatCompletionRequestSystemMessageArgs::default()

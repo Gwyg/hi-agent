@@ -21,10 +21,13 @@ pub(crate) async fn agent_loop(
     // 循环上限:防模型反复调工具无限循环(如工具一直失败、模型钻牛角尖)
     const MAX_TURNS: usize = 20;
 
-    for _ in 0..MAX_TURNS {
-        let messages = memory.view();
+    for turn in 0..MAX_TURNS {
+        // view 内部:等待进行中的压缩、组装压缩视图(硬截断兜底)
+        let messages = memory.view().await;
+        let msg_count = messages.len();
+        tracing::info!(turn, msg_count, "agent 轮次开始");
         // 流式调用:回调里 try_send TokenDelta(channel 满则丢弃,避免阻塞 LLM 流)
-        let response = client
+        let (response, usage) = client
             .chat_stream(messages, |token| {
                 let _ = emit.try_send(EngineEvent::TokenDelta(token.to_string()));
             })
@@ -32,16 +35,22 @@ pub(crate) async fn agent_loop(
 
         match response {
             ChatResponse::Stop(msg) => {
-                // 模型自然结束:落记忆,推送 Done,返回
+                // 模型自然结束:落记忆(带 usage),推送 Done,返回
                 let content = msg.content.clone().unwrap_or_default();
-                memory.add(assistant(&content));
+                tracing::info!(turn, content_len = content.chars().count(), "模型结束(Stop)");
+                memory.add_response(assistant(&content), usage, client);
                 let _ = emit.send(EngineEvent::Done(content)).await;
                 return Ok(());
             }
             ChatResponse::ToolCalls(msg) => {
-                // 回灌 assistant 消息(带 tool_calls),防模型失忆重复请求同一工具
+                // 回灌 assistant 消息(带 tool_calls + usage):防失忆,并触发后台压缩
                 let tool_calls = msg.tool_calls.clone().unwrap_or_default();
-                memory.add(assistant_with_tool_calls(tool_calls.clone()));
+                tracing::info!(turn, tool_count = tool_calls.len(), "模型请求工具调用");
+                memory.add_response(
+                    assistant_with_tool_calls(tool_calls.clone()),
+                    usage,
+                    client,
+                );
 
                 // 逐个执行工具调用
                 for call in &tool_calls {
@@ -76,6 +85,7 @@ pub(crate) async fn agent_loop(
             ChatResponse::Length(msg) => {
                 // 被截断:无完整回复,落记忆后报错,由上层决定是否续传
                 let content = msg.content.clone().unwrap_or_default();
+                tracing::warn!(turn, "回复被截断(length),考虑增大 max_tokens 或压缩记忆");
                 memory.add(assistant(&content));
                 let _ = emit
                     .send(EngineEvent::Error(
@@ -88,6 +98,7 @@ pub(crate) async fn agent_loop(
             }
             ChatResponse::Filtered(msg) => {
                 let content = msg.content.clone().unwrap_or_default();
+                tracing::warn!(turn, "回复被过滤或结束原因为空");
                 memory.add(assistant(&content));
                 let _ = emit
                     .send(EngineEvent::Error("回复被过滤或结束原因为空".to_string()))
@@ -97,6 +108,7 @@ pub(crate) async fn agent_loop(
         }
     }
 
+    tracing::warn!("达到最大轮次 {MAX_TURNS},agent 循环未收敛");
     let _ = emit
         .send(EngineEvent::Error(format!(
             "达到最大轮次 {MAX_TURNS},agent 循环未收敛"
@@ -124,21 +136,33 @@ async fn handle_tool_call(
         })
         .await;
 
+    // args 摘要:防刷屏 + 不泄完整密钥,截到 200 字符
+    let args_summary: String = args.chars().take(200).collect();
+    tracing::info!(tool = name, id, args = %args_summary, "工具调用开始");
+
     let tool = toolbox
         .find(name)
         .ok_or_else(|| anyhow::anyhow!("未知工具: {name}"))?;
 
     match tool.assess(args) {
-        Action::Allow => tool.execute(args).await,
-        Action::Deny(reason) => Err(anyhow::anyhow!("拒绝执行: {reason}")),
+        Action::Allow => {
+            tracing::debug!(tool = name, id, "assess=Allow,直接执行");
+            tool.execute(args).await
+        }
+        Action::Deny(reason) => {
+            tracing::warn!(tool = name, id, reason = %reason, "assess=Deny,拒绝执行");
+            Err(anyhow::anyhow!("拒绝执行: {reason}"))
+        }
         Action::Ask { persistable, keys } => {
             // persistable=true 且 keys 非空:先查会话授权,全命中跳过询问
             // keys 由 assess 用 AST 拆子命令生成,只含触发 Ask 的子命令(精确,不过度授权)
             let granted =
                 persistable && !keys.is_empty() && keys.iter().all(|k| toolbox.grant_check(k));
             if granted {
+                tracing::debug!(tool = name, id, "会话授权命中,跳过询问");
                 return tool.execute(args).await;
             }
+            tracing::info!(tool = name, id, persistable, keys = ?keys, "需用户确认(Ask)");
             // 未授权或 persistable=false,emit Ask 等用户决策
             let (tx_reply, rx_reply) = oneshot::channel();
             let _ = emit
@@ -150,9 +174,13 @@ async fn handle_tool_call(
                 })
                 .await;
             match rx_reply.await {
-                Ok(AskReply::One) => tool.execute(args).await,
+                Ok(AskReply::One) => {
+                    tracing::info!(tool = name, id, "用户确认:仅本次");
+                    tool.execute(args).await
+                }
                 Ok(AskReply::Always) => {
                     // 登记授权键(assess 提供的 keys,只含触发 Ask 的子命令)
+                    tracing::info!(tool = name, id, keys = ?keys, "用户确认:永久授权(Always)");
                     if persistable {
                         for k in &keys {
                             toolbox.grant_record(k.clone());
@@ -160,9 +188,15 @@ async fn handle_tool_call(
                     }
                     tool.execute(args).await
                 }
-                Ok(AskReply::Deny) => Err(anyhow::anyhow!("用户拒绝")),
+                Ok(AskReply::Deny) => {
+                    tracing::warn!(tool = name, id, "用户拒绝");
+                    Err(anyhow::anyhow!("用户拒绝"))
+                }
                 // 前端未响应(reply 被 drop):暂拒,保持原行为
-                Err(_) => Err(anyhow::anyhow!("需用户确认(暂拒): 该操作需人工确认")),
+                Err(_) => {
+                    tracing::warn!(tool = name, id, "Ask reply 被 drop,暂拒");
+                    Err(anyhow::anyhow!("需用户确认(暂拒): 该操作需人工确认"))
+                }
             }
         }
     }
