@@ -51,7 +51,7 @@ impl Tool for ReadTool {
                     "读取文件内容(带行号)。无副作用。\n\
                     适用:看代码/配置/日志/文档内容;确认文件当前状态。\n\
                     不适用:看目录有哪些文件用 search_files(pattern);搜文件内某文本用 search_files(content);看命令输出用 bash。\n\
-                    大文件用 offset/limit 分页,不要一次读全。"
+                    单次默认最多读 2000 行,文件更长时结果尾部会提示剩余行数,用 offset 分页续读,不要试图一次读全。"
                         .to_string(),
                 ),
                 parameters: Some(serde_json::json!({
@@ -158,12 +158,14 @@ fn read_streaming(path: &str, offset: usize, limit: Option<usize>) -> anyhow::Re
 
     let mut out = String::new();
     let mut line_no = 0;
+    let mut truncated = false;
     for line in reader.lines() {
         line_no += 1;
         if line_no <= start {
             continue;
         }
         if line_no > end {
+            truncated = true;
             break;
         }
         let line = line.map_err(|e| {
@@ -176,6 +178,12 @@ fn read_streaming(path: &str, offset: usize, limit: Option<usize>) -> anyhow::Re
         })?;
         let line = line.trim_end_matches('\r');
         out.push_str(&format!("{line_no:>6}\t{line}\n"));
+    }
+    if truncated {
+        out.push_str(&format!(
+            "\n[已显示至 {end} 行(单次上限 {cap} 行),文件还有更多行,用 offset={} 继续]\n",
+            end + 1
+        ));
     }
     Ok(out)
 }
@@ -195,16 +203,25 @@ fn decode_and_split(bytes: &[u8], path: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// 切片 + 行号格式化(类似 cat -n)
+/// 不传 limit 时默认最多读 MAX_LINES_PER_READ 行(防上下文爆炸),超出用 offset 续读
 fn format_lines(lines: &[String], offset: usize, limit: Option<usize>) -> String {
     let start = offset.saturating_sub(1).min(lines.len());
-    let end = match limit {
-        Some(l) => start.saturating_add(l).min(lines.len()),
-        None => lines.len(),
-    };
+    let cap = limit.unwrap_or(MAX_LINES_PER_READ).min(MAX_LINES_PER_READ);
+    let end = start.saturating_add(cap).min(lines.len());
     let mut out = String::new();
     for (i, line) in lines[start..end].iter().enumerate() {
         let line_no = start + i + 1;
         out.push_str(&format!("{line_no:>6}\t{line}\n"));
+    }
+    if end < lines.len() {
+        out.push_str(&format!(
+            "\n[已显示 {}-{} 行(共 {} 行),还有 {} 行未读,用 offset={} 继续]\n",
+            start + 1,
+            end,
+            lines.len(),
+            lines.len() - end,
+            end + 1
+        ));
     }
     out
 }
@@ -227,6 +244,35 @@ mod tests {
         // limit 巨大不应 panic,截到末尾
         let out = format_lines(&lines, 1, Some(usize::MAX));
         assert!(out.contains("a") && out.contains("b"));
+    }
+
+    #[test]
+    fn format_lines_default_caps_at_max() {
+        // 不传 limit 时超过 MAX_LINES_PER_READ 的部分不读,并提示续读
+        let lines: Vec<String> = (1..=MAX_LINES_PER_READ + 100)
+            .map(|i| format!("line{i}"))
+            .collect();
+        let out = format_lines(&lines, 1, None);
+        assert!(out.contains("line1"), "应含首行");
+        assert!(
+            out.contains(&format!("line{}", MAX_LINES_PER_READ)),
+            "应含第 MAX 行"
+        );
+        assert!(
+            !out.contains(&format!("line{}", MAX_LINES_PER_READ + 1)),
+            "不应含超上限行"
+        );
+        assert!(
+            out.contains(&format!("offset={}", MAX_LINES_PER_READ + 1)),
+            "应提示用 offset 续读"
+        );
+    }
+
+    #[test]
+    fn format_lines_no_truncation_note_when_within_limit() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let out = format_lines(&lines, 1, None);
+        assert!(!out.contains("offset="), "读全时不应有续读提示");
     }
 
     #[cfg(unix)]

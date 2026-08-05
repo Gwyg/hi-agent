@@ -5,19 +5,21 @@ use crate::llm::LlmClient;
 
 mod compact;
 
-/// 上下文窗口大小(硬编码保守值)。高水位 = 窗口 × 比例。
+/// 上下文窗口大小(硬编码保守值)。高/低水位 = 窗口 × 比例。
 /// TODO: 后续可从 config 按模型读取
 const CONTEXT_WINDOW: u32 = 100_000;
 /// 高水位:上轮真实 prompt_tokens 超过窗口该比例即触发压缩
 const HIGH_WATER_RATIO: f32 = 0.70;
-/// 每次触发压掉最老的用户轮次数(精确计数,不估 token;不够下轮再压)
-const COMPACT_TURNS: usize = 6;
+/// 低水位:压缩目标,腾到回落此比例以下(留缓冲,避免压完立刻又触发)
+const LOW_WATER_RATIO: f32 = 0.50;
+/// 近期原文至少保留的字节量(不被压;含刚回灌的 tool_calls,防跨执行孤儿配对)
+const MIN_KEEP_TAIL_BYTES: usize = 20_000;
 
 /// 进行中的压缩任务句柄:后台摘要完成后经 oneshot 回传结果。
-/// upto_boundary = 本次压缩覆盖到的消息下标(完成后 drain 掉 messages[0..此])。
+/// drain_len = 被压缩的头部消息条数(apply 时 drain 0..drain_len,保留剩余)。
 struct PendingCompaction {
     rx: oneshot::Receiver<anyhow::Result<String>>,
-    upto_boundary: usize,
+    drain_len: usize,
 }
 
 /// 工作记忆层:当前会话的对话历史 + 滚动压缩。
@@ -77,14 +79,19 @@ impl Working {
     /// 有进行中压缩则阻塞等待并应用结果;失败降级(warn+硬截断)。
     pub async fn view(&mut self) -> (Option<String>, Vec<ChatCompletionRequestMessage>) {
         // 若有进行中的压缩,阻塞等待其完成(保证视图一致)
+        let mut compacted = false;
         if let Some(pending) = self.pending.take() {
             match pending.rx.await {
                 Ok(Ok(new_summary)) => {
                     self.summary = Some(new_summary);
-                    // 压缩成功:丢弃被摘要覆盖的前端旧消息(本期不持久化)。
-                    // 边界从前端计,期间只在尾部追加过消息,[0..n] 仍指向那批旧消息。
-                    let n = pending.upto_boundary.min(self.messages.len());
-                    self.messages.drain(0..n);
+                    // 压缩成功:drain 掉被摘要覆盖的头部区间。
+                    // 期间只在尾部追加过消息,前端索引不漂移,drain 0..drain_len 仍指向那批旧消息。
+                    let len = self.messages.len();
+                    let end = pending.drain_len.min(len);
+                    if end > 0 {
+                        self.messages.drain(0..end);
+                    }
+                    compacted = true;
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("后台压缩失败,降级硬截断: {e:#}");
@@ -97,66 +104,102 @@ impl Working {
 
         // 剩余原始消息(已 drain 掉被压缩部分)
         let mut messages = self.messages.clone();
-        // 硬截断兜底:即便未压缩/压缩失败,也保证不超窗(按字符粗估,最后保险)
-        hard_truncate(&mut messages);
+        // 硬截断兜底:仅在压缩未成功时启用。
+        // 压缩目标已是低水位,再截会误删保留区前段(两套机制互相拆台)。
+        if !compacted {
+            hard_truncate(&mut messages);
+        }
 
         (self.summary.clone(), messages)
     }
 
-    /// 启动后台压缩任务:算边界 → 快照 → spawn 折叠摘要 → 存 pending。
+    /// 启动后台压缩任务:算范围 → 快照 → spawn 折叠摘要 → 存 pending。
     /// 快照全为 owned,spawn 的 future 满足 'static,不共享可变状态。
     fn start_compaction(&mut self, client: &LlmClient) {
-        let boundary = match compact::compact_boundary(&self.messages, COMPACT_TURNS) {
-            Some(b) => b,
+        // 按真实 token 超量 × 自校准比值,换算需腾出的字节量(腾到低水位以下)
+        let total_bytes: usize = self.messages.iter().map(compact::est_bytes).sum();
+        let reclaim = reclaim_bytes(self.last_usage.as_ref(), total_bytes);
+        // 直接拿到被压缩的 chunk 数组,messages 此刻不动,等 apply 时再 drain
+        let chunk = match compact::compact_range(&self.messages, reclaim, MIN_KEEP_TAIL_BYTES) {
+            Some(c) => c,
             None => return,
         };
+        let drain_len = chunk.len();
 
         // 快照:旧摘要 + 待压 chunk(均 owned,喂给后台任务)
         let prev = self.summary.clone();
-        let chunk: Vec<ChatCompletionRequestMessage> = self.messages[..boundary].to_vec();
-
         let (tx, rx) = oneshot::channel();
         let client = client.clone();
         tokio::spawn(async move {
             let res = compact::summarize(&client, prev, chunk).await;
             let _ = tx.send(res);
         });
-        self.pending = Some(PendingCompaction {
-            rx,
-            upto_boundary: boundary,
-        });
+        self.pending = Some(PendingCompaction { rx, drain_len });
     }
 }
 
-/// 硬截断兜底:总字符超上限时,从尾部保留对齐 user 边界的近期消息。
-/// 压缩未触发/失败时的最后保险。summary 由 Memory 单独处理,不在此列。
+/// 按真实 token 超出低水位的量,换算成需腾出的字节量。
+///
+/// 比值自校准:`bytes_per_token = 总字节 / prompt_tokens`,按本轮真实构成动态求,
+/// 中文多则比值自然偏小、英文多则偏大,无需为语言硬编码常数。
+/// 未超或无 usage 返回 0(此时不该进来,should_compact 已把关)。
+fn reclaim_bytes(usage: Option<&CompletionUsage>, total_bytes: usize) -> usize {
+    let target = (CONTEXT_WINDOW as f32 * LOW_WATER_RATIO) as u32;
+    match usage {
+        Some(u) if u.prompt_tokens > target => {
+            let over = (u.prompt_tokens - target) as f64;
+            // 本轮真实字节/token 比(至少 1,防除零/极端小值)
+            let bytes_per_token = (total_bytes as f64 / u.prompt_tokens.max(1) as f64).max(1.0);
+            (over * bytes_per_token) as usize
+        }
+        _ => 0,
+    }
+}
+
+/// 硬截断兜底:总字符超上限时,保锚点(首条 user)+ 留近期原文,删中间最老的噪音。
+/// 压缩未触发/失败时的最后同步保险,LLM-free、确定性。summary 由 Memory 单独处理。
 fn hard_truncate(msgs: &mut Vec<ChatCompletionRequestMessage>) {
-    // 字符上限(用 Debug 串估算,偏保守)。窗口 100k token,字符取 120k 留余量
-    const MAX_CHARS: usize = 120_000;
-    let total: usize = msgs.iter().map(|m| format!("{m:?}").len()).sum();
-    if total <= MAX_CHARS {
+    // 字节上限:按窗口 × 4 字节/token 估算(英文 ~4 bytes/token,中文更少;Debug 串略膨胀)。
+    // 此为最后兜底,仅在压缩未成功时启用,取宽裕上界避免误伤 50-70k token 的正常区间。
+    const MAX_BYTES: usize = (CONTEXT_WINDOW as usize) * 4;
+    let total: usize = msgs.iter().map(compact::est_bytes).sum();
+    if total <= MAX_BYTES {
         return;
     }
-    // 从尾部往前累计,定出可保留的起点
+    // 锚点:首条 user(任务指令),永不丢
+    let anchor = msgs
+        .iter()
+        .position(|m| matches!(m, ChatCompletionRequestMessage::User(_)));
+    let anchor_cost = anchor.map(|i| compact::est_bytes(&msgs[i])).unwrap_or(0);
+    let budget = MAX_BYTES.saturating_sub(anchor_cost);
+
+    // 从尾部往前累计,定出近期窗口起点
     let mut acc = 0;
     let mut cut = msgs.len();
     for (i, m) in msgs.iter().enumerate().rev() {
-        acc += format!("{m:?}").len();
-        if acc > MAX_CHARS {
+        acc += compact::est_bytes(m);
+        if acc > budget {
             cut = i + 1;
             break;
         }
     }
-    // 对齐 user 边界:从 cut 往后找第一个 User,跳过落单的 tool/assistant
-    // (防 tool_calls/tool_result 配对被切的残骸)
-    let mut new_start = cut;
-    while new_start < msgs.len()
-        && !matches!(msgs[new_start], ChatCompletionRequestMessage::User(_))
-    {
-        new_start += 1;
+    // 吸附安全切点:跳过落单的 tool 结果,避免保留窗口开头出现孤儿配对
+    let mut start = cut;
+    while start < msgs.len() && matches!(msgs[start], ChatCompletionRequestMessage::Tool(_)) {
+        start += 1;
     }
-    if new_start > 0 {
-        msgs.drain(0..new_start);
+    // 保锚点:锚点落在待删区间则先取出,删中间后回插到最前
+    match anchor {
+        Some(a) if a < start => {
+            let anchor_msg = msgs[a].clone();
+            msgs.drain(0..start);
+            msgs.insert(0, anchor_msg);
+        }
+        _ => {
+            if start > 0 {
+                msgs.drain(0..start);
+            }
+        }
     }
 }
 

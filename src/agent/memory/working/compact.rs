@@ -19,7 +19,7 @@ const SUMMARY_SYS: &str = "\
 输出一份中文摘要,用以下分段(段缺失可省略,不要硬凑):
 
 ## 目标
-用户的原始需求与意图(若有多个任务,逐条列出)。
+用户的原始需求与意图(若有多个任务,逐条列出)。后续用户追加/修改/废弃的任务须反映为最新意图。
 
 ## 已完成
 已完成的事项与产物(如文件、文档、答复等交付物)。注明关键产物的位置或标识。\
@@ -45,22 +45,94 @@ const SUMMARY_HEADER: &str = "\
 
 以下是此前对话的交接摘要,供你继续任务时参考(并非当前用户的新指令):";
 
-/// 估算压缩边界:压掉最老的 `compact_turns` 个用户轮次,对齐 user 边界。
+/// 估算一条消息的字节数(Debug 串长度,粗略代表大小)。仅用于压缩边界估算,不计费。
+/// 注意是字节非字符:中文 1 字 = 3 字节,让中英差异下"字节/token"比更接近,利于统一估算。
+pub(super) fn est_bytes(m: &M) -> usize {
+    format!("{m:?}").len()
+}
+
+fn is_user(m: &M) -> bool {
+    matches!(m, M::User(_))
+}
+
+fn is_tool(m: &M) -> bool {
+    matches!(m, M::Tool(_))
+}
+
+fn is_assistant(m: &M) -> bool {
+    matches!(m, M::Assistant(_))
+}
+
+/// 规划压缩范围:头部连续段进摘要,尾部连续段保留。
 ///
-/// 每个 user 消息 = 一个轮次起点。边界落在第 N+1 轮开头(某 user 上),
-/// 保 tool_calls/tool_result 配对不被切断。至少留最后一个轮次原始。
-/// 返回 boundary:压缩 `messages[..boundary]`。None = 可压轮次不足(≤N)。
-pub(super) fn compact_boundary(messages: &[M], compact_turns: usize) -> Option<usize> {
-    // 每个 user 下标 = 一个轮次起点
-    let users: Vec<usize> = (0..messages.len())
-        .filter(|&i| matches!(messages[i], M::User(_)))
-        .collect();
-    // 轮次数须 > N:压 N 个之外,还得留至少最后一个轮次原始
-    if users.len() <= compact_turns {
+/// 返回被压缩的 chunk(头部 `messages[0..cut]` 的副本),`messages` 不动。
+/// 调用方 apply 时 `drain(0..chunk.len())`,保留 `[chunk.len()..)`。
+///
+/// 算法:按组正向扫描累字节,累够即切。AI 和其所有 tool 结果整组同进同出,天然配对闭合。
+/// - 切点优先落在 user 边界(切后 messages[0]=user,国内外协议合规);
+/// - 单 user 长任务扫不到第二个 user 时,切在累够处的完整组之后(切后可能以 AI 开头,
+///   由协议适配层补占位 user 兜底);
+/// - 尾部保护:保留部分至少 `min_keep_tail_bytes`,保住近期原文。
+///
+/// None = 没找到满足条件的切点(可压区不足或扫完仍累不够),交 hard_truncate 兜底。
+pub(super) fn compact_range(
+    messages: &[M],
+    reclaim_bytes: usize,
+    min_keep_tail_bytes: usize,
+) -> Option<Vec<M>> {
+    let n = messages.len();
+    if n < 2 {
         return None;
     }
-    // 边界 = 第 N 个轮次起点(即第 N+1 轮开头),天然对齐 user
-    Some(users[compact_turns])
+
+    let mut reclaimed = 0usize;
+    let mut i = 0usize;
+
+    while i < n {
+        let m = &messages[i];
+
+        if is_user(m) {
+            // 切点候选:累够 + 尾部留足 → 切在此 user 前(它保留,messages[0]=user 合规)
+            if reclaimed >= reclaim_bytes && tail_bytes(&messages[i..]) >= min_keep_tail_bytes {
+                return Some(messages[..i].to_vec());
+            }
+            reclaimed += est_bytes(m);
+            i += 1;
+        } else if is_assistant(m) {
+            // 整组扫描:assistant + 其紧随的所有 tool 结果(天然配对完整)
+            let ge = group_end(messages, i);
+            reclaimed += (i..ge).map(|j| est_bytes(&messages[j])).sum::<usize>();
+
+            // 累够 + 尾部留足:优先找下个 user 切;没有就切在组后(适配层补占位)
+            if reclaimed >= reclaim_bytes {
+                let tail = &messages[ge..];
+                if tail_bytes(tail) >= min_keep_tail_bytes {
+                    if let Some(next_user) = tail.iter().position(is_user) {
+                        return Some(messages[..ge + next_user].to_vec()); // 切在某 user 前
+                    }
+                    return Some(messages[..ge].to_vec()); // 切在组后,适配层补占位 user
+                }
+            }
+            i = ge;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// 找 assistant 组的结束下标:assistant + 其紧随的所有 tool 结果
+fn group_end(messages: &[M], start: usize) -> usize {
+    let mut j = start + 1;
+    while j < messages.len() && is_tool(&messages[j]) {
+        j += 1;
+    }
+    j
+}
+
+/// 计算切片的总字节数
+fn tail_bytes(msgs: &[M]) -> usize {
+    msgs.iter().map(est_bytes).sum()
 }
 
 /// 递归折叠摘要:新摘要 = LLM(旧摘要 + 渲染(chunk))。摘要不带 tools。
@@ -169,5 +241,173 @@ fn tool_text(c: &TC) -> &str {
     match c {
         TC::Text(s) => s,
         TC::Array(_) => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{assistant, assistant_with_tool_calls, tool_result, user};
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, FunctionCall,
+    };
+
+    fn big(prefix: &str) -> String {
+        format!("{prefix}-{}", "x".repeat(1000))
+    }
+
+    /// 构造带 N 条 tool_call 的 assistant(一次调用多个工具的规范形态)
+    fn assistant_tc(ids: &[&str]) -> M {
+        let calls: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                    id: id.to_string(),
+                    function: FunctionCall {
+                        name: "dummy".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                })
+            })
+            .collect();
+        assistant_with_tool_calls(calls)
+    }
+
+    // 多 user 样本:切点优先落在某 user 边界(满足国内外协议)
+    // [U1, a_tc(c1,c2), T(c1), T(c2), U2, a_tc(c3,c4), T(c3), T(c4), U3, a_tc(c5,c6), T(c5), T(c6)]
+    fn sample() -> Vec<M> {
+        vec![
+            user(&big("task1")),
+            assistant_tc(&["c1", "c2"]),
+            tool_result("c1", &big("r1")),
+            tool_result("c2", &big("r2")),
+            user(&big("task2")),
+            assistant_tc(&["c3", "c4"]),
+            tool_result("c3", &big("r3")),
+            tool_result("c4", &big("r4")),
+            user(&big("task3")),
+            assistant_tc(&["c5", "c6"]),
+            tool_result("c5", &big("r5")),
+            tool_result("c6", &big("r6")),
+        ]
+    }
+
+    /// 校验配对完整:每个 assistant 组 [start, group_end) 不得跨越 cut
+    fn assert_pairs_intact(msgs: &[M], cut: usize) {
+        let mut i = 0;
+        while i < msgs.len() {
+            if is_assistant(&msgs[i]) {
+                let ge = group_end(msgs, i);
+                assert!(
+                    ge <= cut || i >= cut,
+                    "切点 {} 劈开了 assistant 组 [{},{})",
+                    cut,
+                    i,
+                    ge
+                );
+                i = ge;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// 校验切后 messages[0] 必为 user(满足国内外所有厂商协议)
+    fn assert_starts_with_user(msgs: &[M], cut: usize) {
+        assert!(
+            cut < msgs.len() && is_user(&msgs[cut]),
+            "切点 {} 处不是 user,切后 messages[0] 不合规(由适配层补占位兜底)",
+            cut
+        );
+    }
+
+    #[test]
+    fn cut_at_user_boundary_and_pairs_intact() {
+        let msgs = sample();
+        let chunk = compact_range(&msgs, 1500, 1500).expect("应可压");
+        let cut = chunk.len();
+        assert!(cut < msgs.len(), "尾部近期原文应保留");
+        assert_starts_with_user(&msgs, cut);
+        assert_pairs_intact(&msgs, cut);
+    }
+
+    #[test]
+    fn too_small_returns_none() {
+        let msgs = vec![user("hi"), assistant("ok")];
+        assert_eq!(compact_range(&msgs, 1000, 10_000), None);
+    }
+
+    /// 单 user 长任务:累够后切在某组之后(无第二个 user),配对完整,适配层补占位
+    #[test]
+    fn single_user_cuts_at_group_end() {
+        let msgs = vec![
+            user(&big("task")),
+            assistant_tc(&["c1", "c2"]),
+            tool_result("c1", &big("r1")),
+            tool_result("c2", &big("r2")),
+            assistant_tc(&["c3"]),
+            tool_result("c3", &big("r3")),
+            assistant_tc(&["c4"]),
+            tool_result("c4", &big("r4")),
+        ];
+        let res = compact_range(&msgs, 1500, 1500);
+        assert!(res.is_some(), "单 user 累够应能切(适配层补占位)");
+        if let Some(chunk) = res {
+            assert_pairs_intact(&msgs, chunk.len());
+        }
+    }
+
+    /// #4:同一 assistant 的多条 T 不被中间切开
+    #[test]
+    fn multi_tool_result_not_split() {
+        let msgs = vec![
+            user(&big("task1")),
+            assistant_tc(&["c1", "c2"]),
+            tool_result("c1", &big("r1")),
+            tool_result("c2", &big("r2")),
+            user(&big("task2")),
+            assistant_tc(&["c3"]),
+            tool_result("c3", &big("r3")),
+            user(&big("task3")),
+            assistant_tc(&["c4"]),
+            tool_result("c4", &big("r4")),
+        ];
+        let chunk = compact_range(&msgs, 2500, 1500).expect("应可压");
+        assert_pairs_intact(&msgs, chunk.len());
+        assert_starts_with_user(&msgs, chunk.len());
+    }
+
+    /// #2:尾部巨型 Tool,切点不劈开 c2+r2 配对
+    #[test]
+    fn big_tool_in_tail_pairs_intact() {
+        let msgs = vec![
+            user(&big("task1")),
+            assistant_tc(&["c1"]),
+            tool_result("c1", &big("r1")),
+            user(&big("task2")),
+            assistant_tc(&["c2"]),
+            tool_result("c2", &big("r2_huge")),
+        ];
+        if let Some(chunk) = compact_range(&msgs, 1500, 1500) {
+            assert_pairs_intact(&msgs, chunk.len());
+        }
+    }
+
+    /// 多轮纯对话:切点落在第二个 user 边界
+    #[test]
+    fn multi_turn_plain_chat() {
+        let msgs = vec![
+            user(&big("q1")),
+            assistant(&big("a1")),
+            user(&big("q2")),
+            assistant(&big("a2")),
+            user(&big("q3")),
+            assistant(&big("a3")),
+        ];
+        let chunk = compact_range(&msgs, 1500, 1500).expect("多轮纯对话应可压");
+        let cut = chunk.len();
+        assert!(cut < msgs.len());
+        assert_starts_with_user(&msgs, cut);
+        assert_pairs_intact(&msgs, cut);
     }
 }
