@@ -10,6 +10,14 @@ use async_openai::types::chat::{
 
 use crate::llm::{ChatResponse, LlmClient, system, user};
 
+/// 渲染缓冲容量上界,由水位常量推导:触发压缩时只需腾出 (高水位-低水位) 的量,
+/// chunk 按整组对齐累字节到够即切,会超压最后一组,故留 50% 余量。
+/// 英文最坏 1 token ≈ 4 字节,渲染文本 ≤ Debug 串,该值覆盖 chunk 渲染;
+/// 罕见超界由 String 几何扩容兜底,至多一次。改水位常量自动联动。
+const RENDER_CAP_EST: usize = (super::CONTEXT_WINDOW as f32
+    * (super::HIGH_WATER_RATIO - super::LOW_WATER_RATIO + 0.1)
+    * 4.0) as usize;
+
 const SUMMARY_SYS: &str = "\
 你是对话历史摘要器。下面这份任务型 agent 对话将被压缩成一份\"交接摘要\",\
 供另一个 LLM 接手继续完成任务——它没有这段对话的记忆,全靠你的摘要。
@@ -35,10 +43,34 @@ const SUMMARY_SYS: &str = "\
 若已给出\"已有摘要\",将新增对话融合进对应分段,输出融合后的完整摘要。\
 丢弃寒暄、冗余复述、探索中的废路。简洁但够接手者继续工作。";
 
-/// 估算一条消息的字节数(Debug 串长度,粗略代表大小)。仅用于 push 时缓存,不计费。
-/// 注意是字节非字符:中文 1 字 = 3 字节,让中英差异下"字节/token"比更接近,利于统一估算。
+/// 估算一条消息的字节数(量级同 Debug 串,粗略代表大小)。仅用于 push 时缓存,不计费。
+/// 轻量实现:遍历字段长度累加,零分配——替代 `format!("{m:?}")` 的构造+丢弃(热路径优化)。
+/// 仍是字节非字符:中文 1 字 = 3 字节,维持"字节/token"比语义。
+/// 每条 +80 固定开销覆盖 Debug 结构噪音;下游(切点判断/自校准)只用相对值与求和,
+/// 估算的比例偏差在运算中互相抵消,不影响行为。
 pub(super) fn estimate_bytes(m: &M) -> usize {
-    format!("{m:?}").len()
+    // 每条消息 Debug 串的固定结构噪音(枚举标记、字段名、花括号、引号等)
+    const STRUCT_OVERHEAD: usize = 80;
+    match m {
+        M::User(u) => STRUCT_OVERHEAD + user_text(&u.content).len(),
+        M::Assistant(a) => {
+            let mut n = STRUCT_OVERHEAD;
+            if let Some(c) = &a.content {
+                n += assistant_text(c).len();
+            }
+            if let Some(calls) = &a.tool_calls {
+                for call in calls {
+                    // tool_call 自身结构噪音:id、花括号、字段名
+                    let (name, args) = tool_call_parts(call);
+                    n += name.len() + args.len() + 40;
+                }
+            }
+            n
+        }
+        M::Tool(t) => STRUCT_OVERHEAD + tool_text(&t.content).len(),
+        // Developer/System/Function 不进 working(push 只收 user/assistant/tool),固定值兜底
+        _ => STRUCT_OVERHEAD,
+    }
 }
 
 fn is_user(m: &M) -> bool {
@@ -233,11 +265,10 @@ fn response_text(resp: ChatResponse) -> Option<String> {
 }
 
 /// 把历史渲染成可读文本,供摘要器阅读。
-/// 初始容量按 chunk 的 estimate_bytes 总和的一半预估(render 文本约为 Debug 串的 40-60%),
-/// 避免反复扩容。仅在压缩触发时调一次,非热路径。
+/// 初始容量取 RENDER_CAP_EST(窗口常量推导的安全上界),免去逐条 estimate_bytes
+/// 构造 Debug 串的估算开销。仅在压缩触发时调一次,非热路径。
 fn render_messages(msgs: &[M]) -> String {
-    let cap: usize = msgs.iter().map(estimate_bytes).sum::<usize>() / 2;
-    let mut out = String::with_capacity(cap);
+    let mut out = String::with_capacity(RENDER_CAP_EST);
     for m in msgs {
         match m {
             M::User(u) => {

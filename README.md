@@ -23,6 +23,16 @@ powershell -c "irm https://github.com/Gwyg/hi-agent/releases/latest/download/hi-
 
 安装脚本会把 `hi` 加入 PATH，重开终端后生效。
 
+### 更新
+
+安装器会附带独立的更新程序 `hi-update`。有新版本时运行它即可自动升级：
+
+```bash
+hi-update
+```
+
+（若 `hi-update` 不在 PATH 中，其路径与 `hi` 相同，如 `~/.cargo/bin/hi-update`。从源码构建的用户用 `git pull` + `cargo build --release` 手动更新。）
+
 ## 配置
 
 `hi` 通过环境变量连接大模型，运行前需先配置：

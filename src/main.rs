@@ -26,7 +26,12 @@ async fn main() -> anyhow::Result<()> {
     // 用 daily rolling + non-blocking,guard 必须 hold 到进程末尾
     let (nb_writer, guard) = log_init::init(log_dir.clone());
     tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // 默认 info;设了 RUST_LOG 时仍可覆盖(debug/trace/warn/error)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .with_writer(nb_writer)
         .with_ansi(false) // 日志文件不要 ANSI 颜色码
         .init();
