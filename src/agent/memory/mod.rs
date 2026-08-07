@@ -54,50 +54,18 @@ impl Memory {
     /// 记忆逻辑增长时(三级召回 / 状态块)在此多递几段即可,接口不变。
     pub async fn view(&mut self) -> Vec<ChatCompletionRequestMessage> {
         let (summary, messages) = self.working.view().await;
-        let mut out = Vec::with_capacity(2 + messages.len());
-        out.push(self.core.system(summary.as_deref().as_slice()));
-        // 协议适配:多数厂商要求 system 后必接 user。
-        // 压缩切点可能落在 assistant 组后(单 user 长任务),此处补占位 user 兜底。
-        if needs_placeholder_user(&messages) {
-            out.push(crate::llm::user("(继续上文)"));
-        }
+        // 摘要套 HEADER 后递给 Core 合并进 system(摘要自身只存纯正文,此处加边界)
+        let summary_with_header =
+            summary.map(|s| format!("{}\n\n{}", working::SUMMARY_HEADER, s));
+        let mut out = Vec::with_capacity(1 + messages.len());
+        out.push(self.core.system(summary_with_header.as_deref().as_slice()));
         out.extend(messages);
         out
     }
 }
 
-/// 判断是否需要在 system 后补占位 user。
-/// 首条非 user(含空)时返回 true——压缩切在 assistant 组后或会话初始时兜底协议。
-fn needs_placeholder_user(messages: &[ChatCompletionRequestMessage]) -> bool {
-    !matches!(
-        messages.first(),
-        Some(ChatCompletionRequestMessage::User(_))
-    )
-}
-
 impl Default for Memory {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::{assistant, user};
-
-    #[test]
-    fn placeholder_needed_when_first_not_user() {
-        assert!(needs_placeholder_user(&[assistant("hi")]));
-    }
-
-    #[test]
-    fn placeholder_needed_when_empty() {
-        assert!(needs_placeholder_user(&[]));
-    }
-
-    #[test]
-    fn no_placeholder_when_user_first() {
-        assert!(!needs_placeholder_user(&[user("hi")]));
     }
 }
