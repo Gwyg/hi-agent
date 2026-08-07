@@ -25,13 +25,13 @@ powershell -c "irm https://github.com/Gwyg/hi-agent/releases/latest/download/hi-
 
 ### 更新
 
-安装器会附带独立的更新程序 `hi-update`。有新版本时运行它即可自动升级：
+安装器会附带独立的更新程序 `hi-agent-update`。有新版本时运行它即可自动升级：
 
 ```bash
-hi-update
+hi-agent-update
 ```
 
-（若 `hi-update` 不在 PATH 中，其路径与 `hi` 相同，如 `~/.cargo/bin/hi-update`。从源码构建的用户用 `git pull` + `cargo build --release` 手动更新。）
+（若 `hi-agent-update` 不在 PATH 中，其路径与 `hi` 相同，如 `~/.cargo/bin/hi-agent-update`。从源码构建的用户用 `git pull` + `cargo build --release` 手动更新。）
 
 ## 配置
 
