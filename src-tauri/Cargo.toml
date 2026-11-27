@@ -1,6 +1,6 @@
 [package]
 name = "hi-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "本地运行的 AI 编程助手,只接 DeepSeek"
 authors = ["gwyg"]
 edition = "2021"
@@ -12,7 +12,11 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "hi_agent_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 只产 rlib。模板默认的 ["staticlib", "cdylib", "rlib"] 是给移动端准备的:
+# iOS 要 staticlib、Android 要 cdylib,桌面端(Windows / macOS / Linux)只用 rlib。
+# 那两份产物桌面版一个字节都用不到,却每次构建都要把整个程序再链接两遍——
+# 实测改这一个就够:lib 单元 24.9 s → 7.6 s。将来要上 iOS / Android 时再把对应的加回来。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -100,3 +104,16 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# 只保留行号表，不生成变量类型信息。panic 的 backtrace 照样有「文件:行号」，
+# 但链接器要合并的调试数据小一个数量级（exe 的 PDB 从 236 MB 降到几十 MB）。
+# 需要单步看变量值时，用 `CARGO_PROFILE_DEV_DEBUG=full cargo build` 临时覆盖，
+# 不用改这一行。
+[profile.dev]
+debug = "line-tables-only"
+
+# 依赖一律不带调试信息。它们不需要被单步进去，却是体积的大头——
+# target/debug 曾经到 32 GB，多数是 585 个依赖各自的 PDB。
+# `"*"` 只匹配依赖，不包含本项目自己的包（本项目按上面的 dev 配置走）。
+[profile.dev.package."*"]
+debug = false

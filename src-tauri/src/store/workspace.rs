@@ -45,6 +45,16 @@ pub fn find_by_path(tx: &Transaction<'_>, path: &str) -> Result<Option<Workspace
     )
 }
 
+/// 按 id 取一行。改名与删除都要先确认存在，才谈得上「改成什么」「删了哪个」。
+pub fn load(tx: &Transaction<'_>, id: &str) -> Result<Option<Workspace>> {
+    query_one(
+        tx,
+        &format!("SELECT {COLUMNS} FROM workspace WHERE id = ?1"),
+        params![id],
+        to_workspace,
+    )
+}
+
 /// 插入一行并返回它。`id` 由仓储生成（UUID v7，按字符串排≈按时间排），
 /// 三个时间戳都取当前时刻：新建即「刚打开过」。
 pub fn insert(tx: &Transaction<'_>, path: &str, name: &str) -> Result<Workspace> {
@@ -72,6 +82,50 @@ pub fn touch(tx: &Transaction<'_>, id: &str) -> Result<()> {
         params![now_ms(), id],
     )?;
     Ok(())
+}
+
+/// 改名。只动 `name` 与 `updated_at`：`path` 是唯一键，改名不是「换目录」。
+///
+/// 与 `touch` 分开是刻意的：`last_opened_at` 决定「最近打开」的顺序，
+/// `updated_at` 记元数据变更的时间，混在一起会让「刚改过名」被当成「刚打开过」。
+pub fn rename(tx: &Transaction<'_>, id: &str, name: &str) -> Result<()> {
+    execute(
+        tx,
+        "UPDATE workspace SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![name, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// 删除一个工作区，**连带它的会话与消息**。返回删掉的会话数。
+///
+/// 只删库里的记录，**不碰目录本身**：那是用户的代码，不是我们的数据。
+/// 用户在这里做的事是「不再把这条目录列在列表里」，不是「删掉这个项目」。
+///
+/// 三层都自己删：schema 没有外键，`session.workspace_id` 与 `message.session_id`
+/// 都只是约定，跳一层就会留下一批读不到的孤儿行。
+pub fn delete(tx: &Transaction<'_>, id: &str) -> Result<usize> {
+    let sessions: i64 = query_one(
+        tx,
+        "SELECT count(*) AS n FROM session WHERE workspace_id = ?1",
+        params![id],
+        |row| Ok(row.get("n")?),
+    )?
+    .unwrap_or(0);
+
+    execute(
+        tx,
+        "DELETE FROM message WHERE session_id IN \
+           (SELECT id FROM session WHERE workspace_id = ?1)",
+        params![id],
+    )?;
+    execute(
+        tx,
+        "DELETE FROM session WHERE workspace_id = ?1",
+        params![id],
+    )?;
+    execute(tx, "DELETE FROM workspace WHERE id = ?1", params![id])?;
+    Ok(sessions as usize)
 }
 
 /// 最近打开的那一个。只用于「断点丢了/失效了」时的推断，不参与启动主路径。
@@ -188,6 +242,116 @@ mod tests {
             .expect("查询")
             .expect("应当有记录");
         assert_eq!(recent.id, second.id);
+    }
+
+    /// 改名只动 name，path 不变（path 是唯一键，也是工具层的边界根）。
+    #[test]
+    fn rename_keeps_path() {
+        let tmp = TempStore::new("rename");
+        let ws = tmp
+            .store
+            .tx(|tx| insert(tx, "/proj/demo", "demo"))
+            .expect("插入");
+
+        tmp.store
+            .tx(|tx| rename(tx, &ws.id, "我的项目"))
+            .expect("改名");
+        let found = tmp
+            .store
+            .tx(|tx| load(tx, &ws.id))
+            .expect("查询")
+            .expect("存在");
+        assert_eq!(found.name, "我的项目");
+        assert_eq!(found.path, "/proj/demo", "改名不该动路径");
+        assert!(
+            tmp.store
+                .tx(|tx| find_by_path(tx, "/proj/demo"))
+                .expect("查询")
+                .is_some(),
+            "按路径仍然找得到同一个工作区"
+        );
+    }
+
+    /// 删工作区连带它的会话与消息，别的工作区一行不少。
+    #[test]
+    fn delete_cascades_to_sessions_and_messages() {
+        use crate::ai::llm::types::Msg;
+        use crate::store::{message, session};
+
+        let tmp = TempStore::new("del");
+        let doomed = tmp
+            .store
+            .tx(|tx| insert(tx, "/proj/a", "a"))
+            .expect("插入 a");
+        let kept = tmp
+            .store
+            .tx(|tx| insert(tx, "/proj/b", "b"))
+            .expect("插入 b");
+
+        let doomed_s = tmp
+            .store
+            .tx(|tx| session::insert(tx, &doomed.id, "sa"))
+            .expect("插入会话");
+        let kept_s = tmp
+            .store
+            .tx(|tx| session::insert(tx, &kept.id, "sb"))
+            .expect("插入会话");
+        for id in [&doomed_s.id, &kept_s.id] {
+            tmp.store
+                .tx(|tx| message::insert(tx, id, &Msg::user("hi")))
+                .expect("插入消息");
+        }
+
+        let removed = tmp.store.tx(|tx| delete(tx, &doomed.id)).expect("删除");
+        assert_eq!(removed, 1, "返回删掉的会话数");
+
+        assert!(
+            tmp.store
+                .tx(|tx| load(tx, &doomed.id))
+                .expect("查询")
+                .is_none(),
+            "工作区行该没了"
+        );
+        assert!(
+            tmp.store
+                .tx(|tx| session::load(tx, &doomed_s.id))
+                .expect("查询")
+                .is_none(),
+            "它的会话也该没了"
+        );
+        assert_eq!(
+            count_messages(&tmp.store, &doomed_s.id),
+            0,
+            "会话下的消息一起删"
+        );
+
+        assert!(
+            tmp.store
+                .tx(|tx| load(tx, &kept.id))
+                .expect("查询")
+                .is_some(),
+            "别的工作区不受影响"
+        );
+        assert!(tmp
+            .store
+            .tx(|tx| session::load(tx, &kept_s.id))
+            .expect("查询")
+            .is_some());
+        assert_eq!(count_messages(&tmp.store, &kept_s.id), 1);
+    }
+
+    fn count_messages(store: &Store, session_id: &str) -> i64 {
+        store
+            .tx(|tx| {
+                query_one(
+                    tx,
+                    "SELECT count(*) AS n FROM message WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok(row.get("n")?),
+                )
+            })
+            .expect("查询")
+            .expect("count 有值")
     }
 
     /// `list`：最近打开的在前，`offset` 能翻页，`touch` 过的会被顶到第一页

@@ -102,16 +102,32 @@ pub fn touch(tx: &Transaction<'_>, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// 用户改名。同时刷新 `updated_at`：改名是一次显式的用户动作，列表该把它顶上来。
+/// 用户改名。**不动 `updated_at`**。
 ///
-/// 暂无调用者：侧边栏的改名入口还没做（双击标题那一步）。
-#[allow(dead_code)]
+/// 那一列表示「最后一次有消息的时间」，列表按它倒序排。改名是元数据编辑：
+/// 若也把行顶到最前，用户给一条旧对话起个名字，它会突然跳到第一行——改名前它
+/// 在哪，改完还在哪，才符合预期。（工作区那边没这个问题：排序看 `last_opened_at`，
+/// `updated_at` 只是元数据时间，改名动它不影响顺序。）
+///
+/// 标题长度与空值由用例层判（那是展示口径），这里原样写入。
 pub fn rename(tx: &Transaction<'_>, id: &str, title: &str) -> Result<()> {
     execute(
         tx,
-        "UPDATE session SET title = ?1, updated_at = ?2 WHERE id = ?3",
-        params![title, now_ms(), id],
+        "UPDATE session SET title = ?1 WHERE id = ?2",
+        params![title, id],
     )?;
+    Ok(())
+}
+
+/// 删除一个会话，**连带它的消息**。
+///
+/// 与 `trim_by_workspace` 同一个理由：schema 没有外键，`message.session_id` 只是约定，
+/// 漏删就留下一批永远读不到的消息（占空间，也让「每会话条数」的判断失真）。
+///
+/// 不判断该不该删：是不是当前会话、断点要不要清，都是用例层的事。
+pub fn delete(tx: &Transaction<'_>, id: &str) -> Result<()> {
+    execute(tx, "DELETE FROM message WHERE session_id = ?1", params![id])?;
+    execute(tx, "DELETE FROM session WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -288,6 +304,61 @@ mod tests {
             .expect("查询")
             .expect("存在");
         assert_eq!(found.title, "环境配置");
+    }
+
+    /// 删除会话必须连带删它的消息，且不波及同工作区的其他会话。
+    #[test]
+    fn delete_removes_session_and_its_messages_only() {
+        use crate::ai::llm::types::Msg;
+        use crate::store::message;
+
+        let tmp = TempStore::new("del");
+        let ws = seed_workspace(&tmp.store, "/proj/a");
+        let doomed = tmp.store.tx(|tx| insert(tx, &ws, "要删的")).expect("插入");
+        let kept = tmp.store.tx(|tx| insert(tx, &ws, "留着的")).expect("插入");
+
+        for id in [&doomed.id, &kept.id] {
+            tmp.store
+                .tx(|tx| message::insert(tx, id, &Msg::user("hi")))
+                .expect("插入消息");
+            tmp.store
+                .tx(|tx| message::insert(tx, id, &Msg::assistant("hello")))
+                .expect("插入消息");
+        }
+
+        tmp.store.tx(|tx| delete(tx, &doomed.id)).expect("删除会话");
+
+        assert!(
+            tmp.store
+                .tx(|tx| load(tx, &doomed.id))
+                .expect("查询")
+                .is_none(),
+            "会话行该没了"
+        );
+        assert_eq!(
+            count_messages(&tmp.store, &doomed.id),
+            0,
+            "删会话必须连带删它的消息"
+        );
+        assert_eq!(
+            count_messages(&tmp.store, &kept.id),
+            2,
+            "别的会话的消息不能被牵连"
+        );
+    }
+
+    fn count_messages(store: &Store, session_id: &str) -> i64 {
+        store
+            .tx(|tx| {
+                query_one(
+                    tx,
+                    "SELECT count(*) AS n FROM message WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok(row.get("n")?),
+                )
+            })
+            .expect("查询")
+            .expect("count 有值")
     }
 
     /// 超出上限时删最旧的会话，连带其消息；`protect` 的那个永不删；不跨工作区。

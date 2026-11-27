@@ -30,3 +30,22 @@ export function loadOlder(sessionId: string, beforeSeq: number): Promise<Message
 export function getResumeSession(): Promise<string | null> {
   return invoke<string | null>('get_resume_session')
 }
+
+/**
+ * 改会话标题。空白标题后端会拒绝,错误原样抛出。
+ *
+ * 标题是用户手写的,后端只做空白归一与 40 字上限,不像自动标题那样截到 10 字。
+ */
+export function renameSession(id: string, title: string): Promise<void> {
+  return invoke<void>('rename_session', { id, title })
+}
+
+/**
+ * 删除会话(消息一起删)。
+ *
+ * 删的是当前会话时后端会把模型上下文一起清掉,所以前端要把界面也回到空白——
+ * 否则用户看到的还是那段对话,但下一条消息已经属于新会话。
+ */
+export function deleteSession(id: string): Promise<void> {
+  return invoke<void>('delete_session', { id })
+}

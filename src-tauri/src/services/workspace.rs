@@ -22,6 +22,10 @@ use crate::util::{app_dir, canonical_path, dir_name, resolve_lexical, strip_verb
 
 pub use crate::store::workspace::Workspace;
 
+/// 用户手写的工作区名上限。切换器只有 264px 宽，再长也只能省略，
+/// 但存长一点比截断用户输入更友好（悬浮提示能看到全名）。
+const NAME_MAX_CHARS: usize = 40;
+
 /// 当前工作区。启动时由 [`init`] 写入，之后只在 [`switch`] 里改。
 ///
 /// 与 `path_scope` 里的根是同一件事的两种表示：那边是给工具层看的边界根，
@@ -79,6 +83,74 @@ pub fn switch(store: &Store, raw: &str) -> Result<Workspace> {
 pub fn list(store: &Store, offset: u32, limit: u32) -> Result<Vec<Workspace>> {
     let limit = limit.clamp(1, 50) as i64;
     store.tx(|tx| repo::list(tx, limit, offset as i64))
+}
+
+/// 改名：只改展示名，`path` 不动（那是唯一键，也是工具层的边界根）。
+///
+/// 名字入库那一刻取目录名，之后不再自动跟随目录改名——所以这里是它唯一的改动入口，
+/// 用户不必为了改个显示名去重命名磁盘目录。
+pub fn rename(store: &Store, id: &str, name: &str) -> Result<Workspace> {
+    let name = normalize_name(name)?;
+    let ws = store.tx(|tx| {
+        // 先确认存在：改一行不存在的记录会成功（0 行受影响），但返回的会是 None
+        repo::load(tx, id)?.context("工作区不存在")?;
+        repo::rename(tx, id, &name)?;
+        repo::load(tx, id)?.context("工作区在改名过程中消失")
+    })?;
+
+    // 当前工作区在内存里有一份副本（状态栏显示的就是它），不同步就会一直显示旧名字
+    if current().map(|c| c.id == ws.id).unwrap_or(false) {
+        activate(&ws)?;
+    }
+    Ok(ws)
+}
+
+/// 删除一个工作区记录，**不删磁盘目录**。
+///
+/// 删的是当前工作区时不能把界面留在「没有工作区」的状态，所以立刻回落到另一个
+/// 还在的目录（顺序与启动候选一致：最近打开 → 默认目录），并把断点写过去。
+/// 返回 `Some(新的当前工作区)`；删的不是当前那个则返回 `None`，当前工作区一动没动。
+///
+/// 会话上下文由命令层清：`services` 平级互不感知，这里不调 `conversation`。
+pub fn delete(store: &Store, id: &str) -> Result<Option<Workspace>> {
+    let was_current = current().map(|c| c.id == id).unwrap_or(false);
+
+    let _ = store.tx(|tx| {
+        repo::load(tx, id)?.context("工作区不存在")?;
+        repo::delete(tx, id)
+    })?;
+
+    if !was_current {
+        return Ok(None);
+    }
+
+    // 回落到「最近打开的下一个」，没有才用默认目录——与启动时的候选顺序一致。
+    // 这样删掉当前工作区不会把用户丢进一个空目录：他多半还有别的工作区在用。
+    let next_path = match store.tx(repo::most_recent)? {
+        Some(ws) if Path::new(&ws.path).is_dir() => ws.path,
+        _ => default_dir()?,
+    };
+    let ws = open_or_create(store, &next_path)?;
+    activate(&ws)?;
+    // 会话指针也要清：它指向的是刚被删掉的那个工作区里的会话，留着只会让下次启动
+    // 白失败一次（虽然那条路径会自愈，但没理由主动留一个坏指针）。
+    if let Err(e) = resume::clear_session() {
+        warn!("删除工作区后清理会话断点失败（下次启动会自愈）: {e}");
+    }
+    if let Err(e) = resume::set_workspace(&ws.path) {
+        warn!("删除工作区后断点写回失败（本次已回落，下次启动按最近打开推断）: {e}");
+    }
+    Ok(Some(ws))
+}
+
+/// 展示名归一：trim、连续空白压成一个空格、按字符截断。空名拒绝——
+/// 列表里一行没有名字的目录，用户认不出是哪个。
+fn normalize_name(raw: &str) -> Result<String> {
+    let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return Err(anyhow!("名称不能为空"));
+    }
+    Ok(text.chars().take(NAME_MAX_CHARS).collect())
 }
 
 // ---- 内部 ----

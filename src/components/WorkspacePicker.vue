@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, type ComponentPublicInstance } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useChat } from '../composables/chat'
 import { useWorkspace } from '../composables/workspace'
 import type { WorkspaceView } from '../api/types'
@@ -13,14 +13,23 @@ import type { WorkspaceView } from '../api/types'
  *
  * - 列表按 `last_opened_at` 倒序，后端分页；滚到底再取下一页（懒加载）。
  *   不做预取、不做虚拟滚动：一页 20 条、可视区约 5 行，滚一次够用一阵。
- * - 只读 + 切换，不从列表删任何项：删工作区要先定「清不清它的会话」，另说。
+ * - 每行 hover 才出现改名 / 删除：低频维护动作，常驻会跟名字、路径抢宽度。
+ * - 改名只改**显示名**，不动路径；删除只删**记录**，不动磁盘目录——
+ *   用户在这里做的是「不再列出来」，不是「删掉这个项目」。
  * - 目录被删 / 盘没插的行照样列出（用户可能只是暂时没插盘），
  *   真选中了由后端 `switch` 报错，这里原样提示。
  */
 const PAGE = 20
 
-const { currentWorkspace, workspaceName, switchTo, selectWorkspace, listWorkspaces } =
-  useWorkspace()
+const {
+  currentWorkspace,
+  workspaceName,
+  switchTo,
+  selectWorkspace,
+  listWorkspaces,
+  renameWorkspace,
+  removeWorkspace,
+} = useWorkspace()
 const { isStreaming } = useChat()
 
 const rootEl = ref<HTMLElement | null>(null)
@@ -30,6 +39,11 @@ const items = ref<WorkspaceView[]>([])
 const loading = ref(false)
 const done = ref(false)
 const saving = ref(false)
+
+/** 正在改名的那一行；null = 没有在编辑 */
+const editingId = ref<string | null>(null)
+const draft = ref('')
+const inputEl = ref<HTMLInputElement | null>(null)
 
 // 启动早期可能还没拿到工作区，给个中性占位而不是空白按钮
 const currentName = computed<string>(() => workspaceName.value || '工作区')
@@ -43,6 +57,7 @@ function toggle(): void {
 }
 
 function close(): void {
+  cancelRename()
   open.value = false
 }
 
@@ -80,7 +95,9 @@ function onScroll(): void {
 }
 
 async function choose(ws: WorkspaceView): Promise<void> {
-  if (saving.value) return
+  // 正在改名时整行都是「编辑区域」，点它不该触发切换
+  if (editingId.value) return
+  if (saving.value || isStreaming.value) return
   if (ws.path === currentWorkspace.value) {
     close() // 点当前项等同于关闭，不白跑一次切换
     return
@@ -102,12 +119,96 @@ async function browse(): Promise<void> {
   await selectWorkspace()
 }
 
+// —— 改名 / 删除 ——
+
+// 输入框是 v-if 出来的，v-for 里的 ref 会变成数组，用函数 ref 直接抓元素
+function bindInput(el: Element | ComponentPublicInstance | null): void {
+  inputEl.value = el instanceof HTMLInputElement ? el : null
+}
+
+async function startRename(ws: WorkspaceView): Promise<void> {
+  if (saving.value || isStreaming.value) return
+  editingId.value = ws.id
+  draft.value = ws.name
+  await nextTick()
+  inputEl.value?.focus()
+  inputEl.value?.select()
+}
+
+function cancelRename(): void {
+  editingId.value = null
+  draft.value = ''
+}
+
+/** 提交改名：空白与未改动都直接收场，交给后端只会多一次往返和一条错误提示 */
+async function commitRename(ws: WorkspaceView): Promise<void> {
+  if (editingId.value !== ws.id || saving.value) return
+  const name = draft.value.trim()
+  if (!name || name === ws.name) {
+    cancelRename()
+    return
+  }
+
+  saving.value = true
+  try {
+    await renameWorkspace(ws.id, name)
+    // 就地更新，不重拉整页：重拉会把列表按 last_opened_at 重排，用户眼前的东西会跳
+    ws.name = name
+    // 只在还是这一行在编辑时收场，别把用户刚点开的另一行关掉
+    if (editingId.value === ws.id) cancelRename()
+  } catch (e) {
+    ElMessage.error(`重命名工作区失败：${String(e)}`)
+    inputEl.value?.focus()
+  } finally {
+    saving.value = false
+  }
+}
+
+async function onDelete(ws: WorkspaceView): Promise<void> {
+  if (saving.value || isStreaming.value) return
+  const isCurrent = ws.path === currentWorkspace.value
+  try {
+    await ElMessageBox.confirm(
+      isCurrent
+        ? '这是当前工作区，删除后会自动切到最近使用的另一个工作区（没有就回到默认目录），该目录下的对话记录也会一并删除。磁盘上的文件夹不会被删除。'
+        : `「${ws.name}」下的对话记录会一并删除。磁盘上的文件夹不会被删除。`,
+      '删除这个工作区？',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        confirmButtonClass: 'el-button--danger',
+      }
+    )
+  } catch {
+    return // 用户取消，不是错误
+  }
+
+  saving.value = true
+  try {
+    await removeWorkspace(ws.id)
+    items.value = items.value.filter((x) => x.id !== ws.id)
+    // 删的就是当前工作区：面板里已经没有「当前」可言，直接收起
+    if (isCurrent) close()
+  } catch (e) {
+    ElMessage.error(`删除工作区失败：${String(e)}`)
+  } finally {
+    saving.value = false
+  }
+}
+
 function onDocPointerDown(e: PointerEvent): void {
   if (open.value && rootEl.value && !rootEl.value.contains(e.target as Node)) close()
 }
 
 function onKeydown(e: KeyboardEvent): void {
-  if (e.key === 'Escape') close()
+  if (e.key !== 'Escape') return
+  // 改名中的 Esc 只退出编辑，不关面板——一次按键只做一件事
+  if (editingId.value) {
+    cancelRename()
+    return
+  }
+  close()
 }
 
 onMounted(() => {
@@ -161,22 +262,47 @@ onBeforeUnmount(() => {
       <div class="ws__panel-title">最近打开</div>
 
       <div ref="listEl" class="ws__list" @scroll="onScroll">
-        <button
+        <!-- 用 div 而不是 button：行内要放输入框和两个按钮，button 不能嵌套 button -->
+        <div
           v-for="ws in items"
           :key="ws.id"
           class="ws__item"
-          :class="{ 'ws__item--active': ws.path === currentWorkspace }"
-          type="button"
+          :class="{
+            'ws__item--active': ws.path === currentWorkspace,
+            'ws__item--disabled': saving || isStreaming,
+          }"
           role="menuitemradio"
           :aria-checked="ws.path === currentWorkspace"
-          :disabled="saving || isStreaming"
+          :tabindex="saving || isStreaming ? -1 : 0"
           @click="choose(ws)"
+          @keydown.enter.prevent="choose(ws)"
+          @keydown.space.prevent="choose(ws)"
         >
           <span class="ws__item-main">
-            <span class="ws__item-name">{{ ws.name }}</span>
+            <input
+              v-if="editingId === ws.id"
+              :ref="bindInput"
+              v-model="draft"
+              class="ws__item-input"
+              type="text"
+              maxlength="40"
+              :disabled="saving"
+              @click.stop
+              @keydown.enter.prevent.stop="commitRename(ws)"
+              @keydown.esc.prevent.stop="cancelRename"
+              @keydown.space.stop
+              @blur="commitRename(ws)"
+            />
+            <span v-else class="ws__item-name">{{ ws.name }}</span>
             <span class="ws__item-path">{{ ws.path }}</span>
           </span>
-          <svg v-if="ws.path === currentWorkspace" class="ws__check" viewBox="0 0 16 16" aria-hidden="true">
+
+          <svg
+            v-if="ws.path === currentWorkspace && editingId !== ws.id"
+            class="ws__check"
+            viewBox="0 0 16 16"
+            aria-hidden="true"
+          >
             <path
               d="M3 8.4 L6.4 11.6 L13 4.8"
               fill="none"
@@ -186,7 +312,47 @@ onBeforeUnmount(() => {
               stroke-linejoin="round"
             />
           </svg>
-        </button>
+
+          <div v-if="editingId !== ws.id" class="ws__actions">
+            <button
+              class="ws__action"
+              type="button"
+              :disabled="saving || isStreaming"
+              title="重命名"
+              aria-label="重命名"
+              @click.stop="startRename(ws)"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M10.6 2.9 L13.1 5.4 L5.6 12.9 L2.6 13.4 L3.1 10.4 Z"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
+            <button
+              class="ws__action"
+              type="button"
+              :disabled="saving || isStreaming"
+              title="删除"
+              aria-label="删除"
+              @click.stop="onDelete(ws)"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M3.4 4.8 H12.6 M6.4 4.8 V3.4 H9.6 V4.8 M4.9 4.8 L5.5 12.6 H10.5 L11.1 4.8"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
 
         <div v-if="loading" class="ws__hint">加载中…</div>
         <div v-else-if="items.length === 0" class="ws__hint">暂无工作区</div>
@@ -291,23 +457,26 @@ onBeforeUnmount(() => {
   max-height: 264px;
   overflow-y: auto;
 }
+/* 行本身不再透明切换:图标要盖在名字右侧,底色必须由这一层给,
+   否则浮层底色与行底色不同,悬停时会出现一块明显的方块 */
 .ws__item {
+  --row-bg: transparent;
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
   padding: 6px 8px;
-  border: none;
   border-radius: 8px;
-  background: transparent;
   text-align: left;
   cursor: pointer;
   transition: background 0.15s;
 }
-.ws__item:hover:not(:disabled) {
+.ws__item:hover {
   background: #f5f6f8;
+  --row-bg: #f5f6f8;
 }
-.ws__item:disabled {
+.ws__item--disabled {
   cursor: not-allowed;
 }
 .ws__item-main {
@@ -335,9 +504,11 @@ onBeforeUnmount(() => {
 }
 .ws__item--active {
   background: #f2f6ff;
+  --row-bg: #f2f6ff;
 }
-.ws__item--active:hover:not(:disabled) {
+.ws__item--active:hover {
   background: #eaf1ff;
+  --row-bg: #eaf1ff;
 }
 .ws__item--active .ws__item-name {
   color: #3b82f6;
@@ -348,6 +519,73 @@ onBeforeUnmount(() => {
   height: 13px;
   flex-shrink: 0;
   color: #3b82f6;
+}
+/* 悬停时让位给两个操作图标:同占右侧,一起出现会互相压住 */
+.ws__item:hover .ws__check {
+  visibility: hidden;
+}
+
+/* 就地改名:字号与名字一致,高度压住两行(名字 + 路径)的整体,
+   编辑时不改变行高,列表不会抖一下 */
+.ws__item-input {
+  width: 100%;
+  margin: -1px 0;
+  padding: 1px 5px;
+  border: 1px solid #3b82f6;
+  border-radius: 5px;
+  background: #fff;
+  color: #3f4550;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.3;
+  outline: none;
+}
+.ws__item-input:disabled {
+  background: #f7f8fa;
+  color: #8a919c;
+}
+
+.ws__actions {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  display: none;
+  gap: 1px;
+  padding-left: 10px;
+  transform: translateY(-50%);
+  background: var(--row-bg);
+}
+.ws__item:hover .ws__actions {
+  display: flex;
+}
+.ws__action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #8a919c;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.ws__action svg {
+  width: 13px;
+  height: 13px;
+}
+.ws__action:hover:not(:disabled) {
+  background: rgba(20, 26, 40, 0.07);
+  color: #3f4550;
+}
+.ws__action:last-child:hover:not(:disabled) {
+  color: #d94b4b;
+}
+.ws__action:disabled {
+  color: #ccd1d9;
+  cursor: not-allowed;
 }
 
 .ws__hint {
@@ -392,6 +630,7 @@ onBeforeUnmount(() => {
   .ws__trigger,
   .ws__chevron,
   .ws__item,
+  .ws__action,
   .ws__browse {
     transition: none;
   }

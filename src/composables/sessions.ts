@@ -1,7 +1,7 @@
 import { ref, watch, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 
-import { getResumeSession, listSessions } from '../api/session'
+import { getResumeSession, listSessions, deleteSession, renameSession } from '../api/session'
 import type { SessionSummary } from '../api/types'
 import { useChat } from './chat'
 import { useWorkspace } from './workspace'
@@ -17,7 +17,7 @@ const sessions: Ref<SessionSummary[]> = ref([])
 // 后者闪一下「暂无记录」会让用户以为历史丢了。
 const loaded = ref(false)
 
-const { currentSessionId, isStreaming, openSession } = useChat()
+const { currentSessionId, isStreaming, openSession, clearConversation } = useChat()
 const { workspaceVersion } = useWorkspace()
 
 export interface UseSessions {
@@ -29,6 +29,10 @@ export interface UseSessions {
   refresh: () => Promise<void>
   /** 打开一条历史会话:消息与模型上下文一起切过去 */
   open: (id: string) => Promise<void>
+  /** 改标题。失败把后端错误抛给调用方(列表需要保持原样) */
+  rename: (id: string, title: string) => Promise<void>
+  /** 删除会话。删的是当前会话时界面一起回到空白 */
+  remove: (id: string) => Promise<void>
   /** 启动时用:先拉列表,再按断点自动打开上次那个会话 */
   restore: () => Promise<void>
 }
@@ -65,6 +69,25 @@ async function restore(): Promise<void> {
   }
 }
 
+/** 改标题。不本地改再回滚:失败了列表必须还是原来那个名字,由后端说话。 */
+async function rename(id: string, title: string): Promise<void> {
+  await renameSession(id, title)
+  await refresh()
+}
+
+/**
+ * 删除会话。
+ *
+ * 删的是当前会话时后端已经把模型上下文清空了,界面必须跟着回到空白 ——
+ * 继续显示那段对话会让用户以为还能接着聊,而下一句话其实会写进一个新会话。
+ * 这里只用 `clearConversation`(局部清空),不再调一次「新对话」:后端已经清过。
+ */
+async function remove(id: string): Promise<void> {
+  await deleteSession(id)
+  if (id === currentSessionId.value) clearConversation()
+  await refresh()
+}
+
 // 换工作区 → 整批换掉(会话归属于工作区,不能跨目录留存旧列表)
 watch(workspaceVersion, () => {
   sessions.value = []
@@ -78,5 +101,5 @@ watch(currentSessionId, () => {
 })
 
 export function useSessions(): UseSessions {
-  return { sessions, loaded, refresh, open, restore }
+  return { sessions, loaded, refresh, open, rename, remove, restore }
 }

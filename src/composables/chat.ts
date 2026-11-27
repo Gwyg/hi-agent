@@ -133,14 +133,25 @@ listen<HistoryTrimmedPayload>('history-trimmed', ({ payload }) => {
 const { workspaceVersion } = useWorkspace()
 const { refreshBalanceAfterTurn } = useLlmConfig()
 watch(workspaceVersion, () => {
-  messages.value = greeting('已切换到新的工作目录，对话已清空。')
+  clearView('已切换到新的工作目录，对话已清空。')
+})
+
+/**
+ * 只清界面，不碰后端。
+ *
+ * 单独拆出来是因为有两个调用方的「后端已经清过了」：切换工作目录（后端 `switch`
+ * 里 reset 过）和删除当前会话（后端 `session::delete` 里 reset 过）。这时候再调
+ * `new_chat` 是多余的往返，而失败一次就会让界面停在已经不存在的那段对话上。
+ */
+function clearView(text = '你好，我是 hi-agent，有什么可以帮你？'): void {
+  messages.value = greeting(text)
   currentSessionId.value = null
   hasMore.value = false
   oldestSeq.value = 0
   pendingAsk.value = null
   contextUsage.value = null
   chatVersion.value++
-})
+}
 
 export interface UseChat {
   messages: Ref<ChatMessage[]>
@@ -156,6 +167,8 @@ export interface UseChat {
   sendMessage: (text: string) => Promise<void>
   answerPendingAsk: (decision: AskDecision) => Promise<void>
   startNewChat: () => Promise<void>
+  /** 只把界面清回空白(后端已经清过上下文时用:切目录、删当前会话) */
+  clearConversation: () => void
   /** 打开历史会话（消息 + 模型上下文一起切）；失败把错误抛给调用方 */
   openSession: (id: string) => Promise<void>
   /** 往前翻一页并拼到顶部；失败自己提示，不抛 */
@@ -272,13 +285,7 @@ export function useChat(): UseChat {
   async function startNewChat(): Promise<void> {
     if (isStreaming.value) return
     await newChat()
-    messages.value = greeting('你好，我是 hi-agent，有什么可以帮你？')
-    currentSessionId.value = null
-    hasMore.value = false
-    oldestSeq.value = 0
-    pendingAsk.value = null
-    contextUsage.value = null
-    chatVersion.value++
+    clearView()
   }
 
   /**
@@ -334,6 +341,7 @@ export function useChat(): UseChat {
     sendMessage,
     answerPendingAsk,
     startNewChat,
+    clearConversation: clearView,
     openSession,
     loadOlderMessages,
   }

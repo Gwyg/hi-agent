@@ -41,12 +41,16 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         session::open_session,
         session::load_older,
         session::get_resume_session,
+        session::rename_session,
+        session::delete_session,
         // ===== 杂项（misc.rs，脚手架遗留）=====
         misc::greet,
         // ===== 应用配置（app_config.rs）=====
         app_config::get_workspace,
         app_config::set_workspace,
         app_config::list_workspaces,
+        app_config::rename_workspace,
+        app_config::delete_workspace,
         app_config::get_llm_config,
         app_config::save_llm_config,
         app_config::list_models,

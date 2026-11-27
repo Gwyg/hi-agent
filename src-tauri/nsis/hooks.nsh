@@ -3,8 +3,8 @@
 ; 这个文件只解决一件事：卸载时把 ~\.hi-agent 也清掉。
 ;
 ; 起因：模板自带的「删除应用数据」复选框删的是
-;   $APPDATA\<bundle-id>      即 %APPDATA%\com.hiagent.app
-;   $LOCALAPPDATA\<bundle-id> 即 %LOCALAPPDATA%\com.hiagent.app
+;   $APPDATA\<bundle-id>      即 %APPDATA%\com.gwyg.hiagent
+;   $LOCALAPPDATA\<bundle-id> 即 %LOCALAPPDATA%\com.gwyg.hiagent
 ; 而本程序的数据全在 ~\.hi-agent（SQLite 库、app.toml、日志），模板够不到。
 ; 用户勾了复选框、以为删干净了，重装后会话历史却一条不少 —— 认知错位。
 ;

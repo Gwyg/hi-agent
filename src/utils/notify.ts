@@ -27,13 +27,13 @@ const ERROR_PREVIEW_CHARS = 60
  *
  * 1. **标题会变成 Windows PowerShell**。`notify-rust` 的 Windows 后端在没拿到 AUMID 时
  *    回退到 `Toast::POWERSHELL_APP_ID`，图标也跟着变成 PowerShell；而插件只在「exe 不在
- *    `target/debug` / `target/release` 下」时才把 `com.hiagent.app` 传下去——开发时永远不传。
+ *    `target/debug` / `target/release` 下」时才把 `com.gwyg.hiagent` 传下去——开发时永远不传。
  *    于是 dev 的 toast 顶着一个不属于我们的名字，比不弹还难看。
  * 2. **会双响**。它照样能弹（PowerShell 的 AUMID 系统上是注册过的），而 Windows toast
  *    自带系统通知音（`notify-rust` 转给 WinRT，XML 里不带 audio 节点 → 系统用默认音），
  *    再叠上我们自己的合成音就是两声。
  *
- * 安装包（NSIS/MSI）会把 `com.hiagent.app` 注册进注册表，插件那时也会正常带上它，
+ * 安装包（NSIS/MSI）会把 `com.gwyg.hiagent` 注册进注册表，插件那时也会正常带上它，
  * 标题和图标都是 hi-agent，声音交给系统——所以发布环境不需要我们的合成音。
  *
  * Vite 在打包时把这个常量折成 `false`，整段音频代码会一起被 tree-shake 掉。

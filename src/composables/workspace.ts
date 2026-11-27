@@ -26,6 +26,10 @@ export interface UseWorkspace {
   selectWorkspace: () => Promise<void>
   /** 分页取工作区(最近打开在前);limit 后端会再夹紧一次 */
   listWorkspaces: (offset: number, limit: number) => Promise<WorkspaceView[]>
+  /** 改显示名(不动路径、不动磁盘目录);改的是当前工作区时名字立刻生效 */
+  renameWorkspace: (id: string, name: string) => Promise<void>
+  /** 删除工作区记录(磁盘目录保留);删的是当前那个会回落到默认目录 */
+  removeWorkspace: (id: string) => Promise<void>
 }
 
 /**
@@ -72,6 +76,22 @@ export function useWorkspace(): UseWorkspace {
     return invoke<WorkspaceView[]>('list_workspaces', { offset, limit })
   }
 
+  // 改名只可能影响显示名:路径没变,所以不触发 workspaceVersion(那会让对话清空)
+  async function renameWorkspace(id: string, name: string): Promise<void> {
+    const ws = await invoke<WorkspaceView>('rename_workspace', { id, name })
+    if (ws.path === currentWorkspace.value) workspaceName.value = ws.name
+  }
+
+  // 删的是当前工作区时后端已回落到默认目录并清空对话,这里只是跟上展示状态。
+  // 删的不是当前那个 → 返回 null,当前工作区一点没动,不必刷新页面。
+  async function removeWorkspace(id: string): Promise<void> {
+    const next = await invoke<WorkspaceView | null>('delete_workspace', { id })
+    if (!next) return
+    currentWorkspace.value = next.path
+    workspaceName.value = next.name
+    workspaceVersion.value++
+  }
+
   return {
     currentWorkspace,
     workspaceName,
@@ -80,5 +100,7 @@ export function useWorkspace(): UseWorkspace {
     switchTo,
     selectWorkspace,
     listWorkspaces,
+    renameWorkspace,
+    removeWorkspace,
   }
 }

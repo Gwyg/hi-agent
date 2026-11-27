@@ -56,6 +56,38 @@ pub fn list_workspaces(
         .map_err(|e| format!("读取工作区列表失败: {e:#}"))
 }
 
+/// 给工作区改显示名（不动 `path`，也不动磁盘目录）。
+///
+/// 改的是当前工作区时，服务层会同步内存里的那份副本，状态栏立刻跟着变。
+#[tauri::command]
+pub fn rename_workspace(
+    state: State<'_, Arc<Store>>,
+    id: String,
+    name: String,
+) -> Result<WorkspaceView, String> {
+    workspace_service::rename(state.inner(), &id, &name)
+        .map(WorkspaceView::from)
+        .map_err(|e| format!("重命名工作区失败: {e:#}"))
+}
+
+/// 删除一个工作区记录：只删库里的行，**不删磁盘目录**。
+///
+/// 删的是当前工作区时返回回落后的新工作区（默认目录），此时会话上下文必须一起清——
+/// 顺序和 `set_workspace` 一致：先切工作区，再清对话。`services` 平级互不感知，
+/// 所以这一步编排只能在命令层。
+#[tauri::command]
+pub async fn delete_workspace(
+    state: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<Option<WorkspaceView>, String> {
+    let next = workspace_service::delete(state.inner(), &id)
+        .map_err(|e| format!("删除工作区失败: {e:#}"))?;
+    if next.is_some() {
+        crate::services::conversation::reset().await;
+    }
+    Ok(next.map(WorkspaceView::from))
+}
+
 /// 取大模型配置(脱敏视图):供前端启动时判断「是否已配置」并预填表单。
 /// api_key 永不回明文,只回 `api_key_set` 与末 4 位掩码。
 /// `model` 回的是**生效值**(文件里有就用,没有就是内置兜底),故前端恒非空。

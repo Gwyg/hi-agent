@@ -179,3 +179,23 @@ pub fn load_older(
 pub fn get_resume_session() -> Option<String> {
     service::resume_id()
 }
+
+/// 改会话标题。空白标题由服务层拒绝，错误原样给前端。
+#[tauri::command]
+pub fn rename_session(
+    state: State<'_, Arc<Store>>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    service::rename(state.inner(), &id, &title).map_err(|e| format!("重命名会话失败: {e:#}"))
+}
+
+/// 删除一个会话（消息一起删）。
+///
+/// 删的是当前会话时服务层会把模型上下文一起清掉，前端只需把界面回到空白。
+#[tauri::command]
+pub async fn delete_session(state: State<'_, Arc<Store>>, id: String) -> Result<(), String> {
+    service::delete(state.inner(), &id)
+        .await
+        .map_err(|e| format!("删除会话失败: {e:#}"))
+}

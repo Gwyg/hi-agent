@@ -95,3 +95,61 @@ pub fn older(store: &Store, session_id: &str, before_seq: i64) -> Result<message
 pub fn resume_id() -> Option<String> {
     crate::config::resume::get().session
 }
+
+/// 用户手写的标题上限。
+///
+/// 自动标题截到 10 字（侧边栏一行的宽度），改名不该沿用那个口径——用户主动写的
+/// 名字短了就没意义。40 字足够表达，再长在列表里也只能靠省略号。
+const TITLE_MAX_CHARS: usize = 40;
+
+/// 改会话标题。
+///
+/// 空标题一律拒绝：列表里留一个点不中的空行没有意义，也让删掉重来变成唯一出路。
+/// 连续空白压成一个空格，与自动标题同一个口径（见 `conversation::title_of`）。
+pub fn rename(store: &Store, id: &str, title: &str) -> Result<()> {
+    let title = normalize_title(title)?;
+    let ws = workspace::current().context("工作区未初始化")?;
+    store.tx(|tx| {
+        let row = session::load(tx, id)?.context("会话不存在")?;
+        // 与 `open` 同一个判断：别的目录的会话当它不存在，不让界面跨目录改名
+        if row.workspace_id != ws.id {
+            bail!("会话不属于当前工作区");
+        }
+        session::rename(tx, id, &title)
+    })
+}
+
+/// 删除一个会话（消息一起删）。
+///
+/// 两件收尾必须做，少一件都会留下指向不存在数据的指针：
+/// - 断点指着它 → 清掉，否则每次启动都白失败一次；
+/// - 它正被模型用着 → 清内存上下文，否则下一条消息会往已经不存在的那一行里写。
+pub async fn delete(store: &Store, id: &str) -> Result<()> {
+    let ws = workspace::current().context("工作区未初始化")?;
+    store.tx(|tx| {
+        let row = session::load(tx, id)?.context("会话不存在")?;
+        if row.workspace_id != ws.id {
+            bail!("会话不属于当前工作区");
+        }
+        session::delete(tx, id)
+    })?;
+
+    if crate::config::resume::get().session.as_deref() == Some(id) {
+        if let Err(e) = crate::config::resume::clear_session() {
+            tracing::warn!(error = %e, "清理被删会话的断点失败");
+        }
+    }
+    if conversation::current_id().as_deref() == Some(id) {
+        conversation::reset().await;
+    }
+    Ok(())
+}
+
+/// 标题归一：trim、连续空白压成一个空格、按字符截断。
+fn normalize_title(raw: &str) -> Result<String> {
+    let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        bail!("标题不能为空");
+    }
+    Ok(text.chars().take(TITLE_MAX_CHARS).collect())
+}

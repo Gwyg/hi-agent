@@ -1,15 +1,50 @@
 name: Release
 
-# 只在推 tag 时出安装包。版本号以 src-tauri/tauri.conf.json 为准，
-# tag 必须与它一致（下面有一步校验，不一致直接失败，避免发错版本）。
+# 推 tag 出安装包（Windows + macOS 各一个）。
+# 版本号以 src-tauri/tauri.conf.json 为准，tag 必须与它一致（verify 那一步校验，
+# 不一致直接失败，避免发错版本）。产物先进 draft release，人工确认齐全再发布。
 on:
   push:
     tags:
       - 'v*'
 
+# 手动重跑同一个 tag 时不要并发：两个 job 会抢同一个 release 上传
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  windows:
-    runs-on: windows-latest
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与 tauri.conf.json 版本一致
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag 与 tauri.conf.json 的 version($ver) 不一致"
+            exit 1
+          fi
+          echo "版本号一致: $ver"
+
+  build:
+    needs: verify
+    strategy:
+      # 两个平台互不牵连：macOS 编挂了不该连 Windows 的包一起发不出去
+      fail-fast: false
+      # 串行：两个 job 都要往同一个 draft release 上传，并行会撞「release 已存在」
+      max-parallel: 1
+      matrix:
+        include:
+          - os: windows-latest
+            args: ''
+          # macos-latest 是 arm64 机器；打 universal 包，一颗 dmg 同时跑 M 系列与 Intel。
+          # 代价是要装两个 target，且 x86_64 走交叉编译（Apple clang 原生支持双架构）。
+          - os: macos-latest
+            args: '--target universal-apple-darwin'
+    runs-on: ${{ matrix.os }}
     permissions:
       # tauri-action 要创建 draft release 并上传产物
       contents: write
@@ -23,23 +58,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: 安装 macOS 双架构 target
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       # 缓存 ~/.cargo 与 src-tauri/target。release 是 LTO + codegen-units=1，
-      # 冷编译十几分钟，缓存命中后通常压到几分钟。
+      # 冷编译十几分钟，缓存命中后通常压到几分钟。按 os 分开存，
+      # 免得 Windows 的 target 目录和 mac 的混在一份缓存里互相顶掉。
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.os }}
 
       - run: npm ci
-
-      - name: 校验 tag 与 tauri.conf.json 版本一致
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}".TrimStart('v')
-          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ($tag -ne $conf) {
-            throw "tag v$tag 与 tauri.conf.json 的 version($conf) 不一致"
-          }
-          Write-Host "版本号一致: $conf"
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -50,14 +81,35 @@ jobs:
           # 先出草稿，人工确认产物齐全再手动发布
           releaseDraft: true
           prerelease: false
-          args: --bundles nsis,msi
+          # bundle.targets 在 tauri.conf.json 里是 "all"，即各平台出各自的全套产物：
+          # Windows 出 nsis + msi，macOS 出 app + dmg。这里只额外指定 mac 的目标三元组。
+          args: ${{ matrix.args }}
           releaseBody: |
-            下载 `hi-agent_*_x64-setup.exe`（推荐）或 `hi-agent_*_x64_en-US.msi` 安装。
+            两个平台各一个包，按自己的系统下：
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Windows | `hi-agent_*_x64-setup.exe`（推荐）或 `hi-agent_*_x64_en-US.msi` |
+            | macOS | `hi-agent_*_universal.dmg`（Apple Silicon 与 Intel 通用） |
 
             ### 安装时可能遇到
-            - **Windows 会提示「已保护你的电脑」**：安装包未做代码签名，属正常现象。
+            - **Windows 提示「已保护你的电脑」**：安装包未做代码签名，属正常现象。
               点「更多信息」→「仍要运行」即可，也可先在文件属性里勾选「解除锁定」。
+            - **macOS 提示「已损坏，无法打开」**：未签名也未公证，是 Gatekeeper 的拦截，不是文件坏了。
+              把 `hi-agent.app` 拖进「应用程序」后执行一次：
+              ```
+              xattr -dr com.apple.quarantine /Applications/hi-agent.app
+              ```
+              之后正常双击即可（或在 Finder 里右键 →「打开」）。
+            - macOS 若仍被拦，到「系统设置 → 隐私与安全性」底部点「仍要打开」。
 
             ### 数据位置
-            - 会话记录、配置与日志都在 `%USERPROFILE%\.hi-agent`，与安装目录无关。
-            - 卸载时勾选「删除应用数据」会连同该目录一并删除；不勾则保留，重装可继续用。
+            - Windows：`%USERPROFILE%\.hi-agent`
+            - macOS：`~/.hi-agent`
+            - 与安装目录无关。Windows 卸载时勾选「删除应用数据」会连同该目录一并删除；
+              不勾则保留，重装可继续用。
+
+            ### 从 0.1.0 升上来
+            应用标识由 `com.hiagent.app` 改为 `com.gwyg.hiagent`（原标识以 `.app` 结尾，
+            macOS 不允许）。Windows 上 0.1.0 不会被自动升级覆盖，请先卸载旧版再装；
+            数据在 `~/.hi-agent`，卸载不勾「删除应用数据」就不会丢。

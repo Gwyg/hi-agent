@@ -272,6 +272,14 @@ pub async fn reset() {
     crate::ai::agent::context::reset_context().await;
 }
 
+/// 模型此刻挂在哪个会话上。`None` = 处于「新对话」且还没落库。
+///
+/// 只给「删会话」那条路径用：删掉的正好是当前会话时，内存上下文必须一起清，
+/// 否则下一条消息会往一个已经不存在的 session 行里写。
+pub fn current_id() -> Option<String> {
+    lock_session().as_ref().map(|s| s.id.clone())
+}
+
 /// 把「当前会话」切到一个已存在的会话(用户点开侧边栏里的历史会话)。
 ///
 /// 三件事必须一起做,缺一件都会让界面和后端对不上:
