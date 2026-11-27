@@ -8,6 +8,9 @@ import { useSessions } from '../composables/sessions'
  * 只做两件事:告诉用户有哪些对话、点一条打开它。不排序、不分组、不在本地新增——
  * 顺序由后端按 `updated_at` 决定,标题是建行时按首条输入截的。
  *
+ * 顶部的「对话」标签是**分组标题**而非列表首项:它在滚动区之外,往上翻历史时留在原位。
+ * 没有它时「新对话」按钮与会话条目直接相接,两者一个是操作、一个是导航,视觉上混成一列。
+ *
  * 流式回复期间整列置灰:那一轮持着上下文锁,点会话会卡在锁上直到它跑完。
  */
 const { sessions, loaded, open } = useSessions()
@@ -16,30 +19,55 @@ const { currentSessionId, isStreaming } = useChat()
 
 <template>
   <div class="sessions">
-    <div v-if="loaded && sessions.length === 0" class="sessions__empty">还没有对话</div>
+    <!-- 分组标题固定在滚动区外:它是「这一列是什么」的标识,不该随列表滚走 -->
+    <div class="sessions__label">对话</div>
 
-    <button
-      v-for="s in sessions"
-      :key="s.id"
-      class="sessions__item"
-      :class="{ 'sessions__item--active': s.id === currentSessionId }"
-      type="button"
-      :disabled="isStreaming"
-      :title="s.title"
-      @click="open(s.id)"
-    >
-      {{ s.title }}
-    </button>
+    <div class="sessions__scroll">
+      <div v-if="loaded && sessions.length === 0" class="sessions__empty">暂无记录</div>
+
+      <button
+        v-for="s in sessions"
+        :key="s.id"
+        class="sessions__item"
+        :class="{ 'sessions__item--active': s.id === currentSessionId }"
+        type="button"
+        :disabled="isStreaming"
+        :title="s.title"
+        @click="open(s.id)"
+      >
+        {{ s.title }}
+      </button>
+    </div>
   </div>
 </template>
 
 <style scoped>
-/* 占满「新对话」与侧边栏底部之间的空间,自己滚。
-   min-height: 0 不能省:flex 子项的默认最小高度是内容高度,不加就撑破侧边栏。 */
+/* 占满「新对话」与侧边栏底部之间的空间:标题固定、列表自己滚。
+   min-height: 0 不能省:flex 子项的默认最小高度是内容高度,不加就撑破侧边栏。
+   滚动交给内层 —— 外层一旦也有 overflow,标题会跟着列表一起滚走。 */
 .sessions {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
   margin-top: 14px;
+}
+
+/* 分组标题:字号压到 11px、用最浅的一档灰,只做「这列是什么」的说明,
+   不与可点击的会话标题争视觉权重。left padding 与条目文字对齐。 */
+.sessions__label {
+  flex-shrink: 0;
+  padding: 0 8px;
+  margin-bottom: 6px;
+  color: #a2a9b5;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  user-select: none;
+}
+
+.sessions__scroll {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }
 

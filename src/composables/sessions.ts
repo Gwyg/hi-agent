@@ -14,7 +14,7 @@ import { useWorkspace } from './workspace'
  */
 const sessions: Ref<SessionSummary[]> = ref([])
 // 是否已经拉过一次。列表为空时用来区分「真的没有对话」和「还没查完」——
-// 后者闪一下「还没有对话」会让用户以为历史丢了。
+// 后者闪一下「暂无记录」会让用户以为历史丢了。
 const loaded = ref(false)
 
 const { currentSessionId, isStreaming, openSession } = useChat()

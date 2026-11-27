@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>hi-agent</title>
+  <rect width="1024" height="1024" rx="230" fill="#16181D" />
+  <path d="M358 330 L474 512 L358 694" fill="none" stroke="#F2F4F8" stroke-width="124"
+        stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="651" cy="512" r="78" fill="#3DD68C" />
+</svg>

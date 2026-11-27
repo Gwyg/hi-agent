@@ -1,0 +1,63 @@
+name: Release
+
+# 只在推 tag 时出安装包。版本号以 src-tauri/tauri.conf.json 为准，
+# tag 必须与它一致（下面有一步校验，不一致直接失败，避免发错版本）。
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      # tauri-action 要创建 draft release 并上传产物
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 缓存 ~/.cargo 与 src-tauri/target。release 是 LTO + codegen-units=1，
+      # 冷编译十几分钟，缓存命中后通常压到几分钟。
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: 校验 tag 与 tauri.conf.json 版本一致
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne $conf) {
+            throw "tag v$tag 与 tauri.conf.json 的 version($conf) 不一致"
+          }
+          Write-Host "版本号一致: $conf"
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'hi-agent ${{ github.ref_name }}'
+          # 先出草稿，人工确认产物齐全再手动发布
+          releaseDraft: true
+          prerelease: false
+          args: --bundles nsis,msi
+          releaseBody: |
+            下载 `hi-agent_*_x64-setup.exe`（推荐）或 `hi-agent_*_x64_en-US.msi` 安装。
+
+            ### 安装时可能遇到
+            - **Windows 会提示「已保护你的电脑」**：安装包未做代码签名，属正常现象。
+              点「更多信息」→「仍要运行」即可，也可先在文件属性里勾选「解除锁定」。
+
+            ### 数据位置
+            - 会话记录、配置与日志都在 `%USERPROFILE%\.hi-agent`，与安装目录无关。
+            - 卸载时勾选「删除应用数据」会连同该目录一并删除；不勾则保留，重装可继续用。

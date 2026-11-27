@@ -40,5 +40,7 @@ Desktop.ini
 # package-lock.json         前端依赖锁定
 # src-tauri/Cargo.lock      二进制应用必须锁依赖版本，缺它构建不可复现
 # src-tauri/icons/          tauri.conf.json 引用的应用图标
+# src-tauri/nsis/           安装器钩子 hooks.nsh 与向导图，打包时被 tauri.conf.json 引用
 # src-tauri/capabilities/   权限声明，运行时校验依据
 # src-tauri/tauri.conf.json 应用配置
+# .github/workflows/        发版流水线
