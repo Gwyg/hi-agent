@@ -1,0 +1,44 @@
+# ============================================================
+# hi-agent · Tauri 2 (Rust) + Vue 3 (Vite) 桌面应用
+# 只写「这个项目真的会产生」的规则，不堆通用模板
+# ============================================================
+
+# ---- 前端 / Node ----
+node_modules/
+# Vite 构建产物（tauri.conf.json 的 frontendDist 指向 ../dist）
+dist/
+*.local
+*.log
+npm-debug.log*
+
+# ---- Rust / Tauri ----
+# Cargo 编译产物，体积以 GB 计（src-tauri/target 由这条覆盖）
+target/
+# Tauri 构建时按 capabilities 重新生成，只供编辑器补全，不参与运行
+src-tauri/gen/schemas/
+
+# ---- 运行时数据 ----
+# 正式数据住在 ~/.hi-agent（SQLite 单库 + app.toml），不在仓库内。
+# 这条纯属防御：本地调试若把库建在项目里，不能让会话内容跟着进版本库。
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 编辑器 / 操作系统 ----
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+
+# ---- 本地工具数据 ----
+.workbuddy/
+
+# ---- 反向说明：以下**故意提交**，不要加进忽略列表 ----
+# package-lock.json         前端依赖锁定
+# src-tauri/Cargo.lock      二进制应用必须锁依赖版本，缺它构建不可复现
+# src-tauri/icons/          tauri.conf.json 引用的应用图标
+# src-tauri/capabilities/   权限声明，运行时校验依据
+# src-tauri/tauri.conf.json 应用配置

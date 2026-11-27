@@ -1,0 +1,102 @@
+[package]
+name = "hi-agent"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "hi_agent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+# 系统通知（左下角 toast）：一轮对话在用户离开窗口后跑完时提醒。
+# 权限走 capabilities 的 notification:default，运行时再用 isPermissionGranted 兜一次。
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 自研 DeepSeek 客户端：HTTP 与 SSE 分帧。stream 打开 bytes_stream()。
+reqwest = { version = "0.13", features = ["stream"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+anyhow = "1"
+dotenvy = "0.15"
+# tools 模块依赖：工具 trait 异步 + 沙箱路径/命令安全 + 搜索
+async-trait = "0.1"
+dirs = "5"
+regex = "1"
+glob = "0.3"
+ignore = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+# 工具执行用到的异步运行时能力（process / time / blocking）
+tokio = { version = "1", features = ["full"] }
+# 取消令牌（CancellationToken）：会话取消沿调用链向下传递，替代手写 AtomicBool + 轮询
+tokio-util = { version = "0.7", features = ["rt"] }
+# 日志：bash 等工具内部用 tracing 打点；run() 启动时调用 init_logging() 安装 subscriber，
+# 开发环境额外输出到 stdout（终端可见），并始终写入 ~/.hi-agent/logs 滚动文件。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+# 应用配置持久化(workspace 等运行时设置写 ~/.hi-agent/app.toml,人可手编)
+toml = "0.8"
+# 格式保留写回:save() 只覆盖变更字段,用户手写的注释/排版原样保留(toml crate 写回会丢注释)
+toml_edit = "0.22"
+# 命令 pattern 匹配:支持 `*` / `?` / `[rf]` 字符集(替代 wildmatch——后者无字符类能力)
+globset = "0.4"
+# api_key 落盘加密(util::secret):密钥由本机标识派生,文件被拷走也解不开。
+# AEAD 用业界标准的 AES-256-GCM,密钥派生用 SHA-256,密文用 base64 存进 app.toml。
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+# 存储层（store）：程序生成的结构化数据统一进 SQLite 单库。
+# `bundled` 把 sqlite3.c 一起编译，运行时不依赖系统库（Windows/macOS/Linux 行为一致，
+# 且 SQLite 版本由我们锁定）；代价是首次编译多几分钟、二进制大约 +1MB。
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+# 标识符（util::id）：UUID v7 高位是毫秒时间戳，按字符串排序≈按创建时间排序
+uuid = { version = "1.29.3", features = ["v7"] }
+
+# bash_safety 的 unix AST 解析器（仅 unix 编译；Windows 用 cmd 字符串方案，不依赖此）
+[target.'cfg(unix)'.dependencies]
+tree-sitter = "0.25"
+tree-sitter-bash = "0.23"
+# 进程组回收：kill(-pgid, SIGKILL) 清掉 shell 派生出的后台进程
+libc = "0.2"
+
+# 与上一段同版本、重复声明一次：dev-dependencies 只在 test/bench 参与编译，
+# 让 Windows 开发机也能跑 unix 分类器的解析/判定用例（模块在 cfg(test) 下编译）。
+# 不影响 windows 的 release 构建（不编译、不入包）
+[dev-dependencies]
+# 临时目录：存储层测试与 demo 每条用例都开一个独立库文件，互不干扰也不污染 ~/.hi-agent
+tempfile = "3.27.0"
+tree-sitter = "0.25"
+tree-sitter-bash = "0.23"
+
+# Windows 进程树回收(JobObject):复用 Tauri 已间接引入的 windows-sys 0.59,不引入新版本
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

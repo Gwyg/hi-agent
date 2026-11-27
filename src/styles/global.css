@@ -1,0 +1,38 @@
+/* 桌面应用外壳:窗口整体固定,不允许页面级滚动。
+   滚动只发生在内容组件内部(如聊天消息区、长设置页),外壳(侧边栏/工作目录条/输入区)永远不动。
+
+   注意:浏览器默认给 body 8px margin,若不做 reset,
+   `.app { height: 100vh }` + 上下 margin 会让文档总高达 100vh + 16px,
+   从而在 html 层逼出一条整页滚动条 —— 表现就是"整个应用能被上下滑动"。 */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* 统一的 hover 说明浮层(HiTooltip):深色底 + 白字,在灰白界面里形成强调而不刺眼。
+   ElTooltip 本身是 dark 效果,这里只收紧底色、圆角、阴影和长文本换行;
+   浮层挂在 body 上,不受消息区 overflow 裁剪。 */
+.hi-tooltip.el-popper.is-dark {
+  max-width: min(360px, 80vw);
+  padding: 7px 10px;
+  background: #1f2329;
+  border: 1px solid #303640;
+  border-radius: 8px;
+  color: #f5f6f8;
+  font-size: 12px;
+  line-height: 1.5;
+  letter-spacing: 0.1px;
+  /* 允许调用方用 \n 分行列出多项数字;单行文案不受影响(空格照常折叠) */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 24px rgba(15, 18, 24, 0.28);
+}
+/* 箭头必须跟底色一致,否则深底上会翘起一个浅灰小三角 */
+.hi-tooltip.el-popper.is-dark .el-popper__arrow::before {
+  background: #1f2329;
+  border-color: #303640;
+}

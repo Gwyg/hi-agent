@@ -1,0 +1,35 @@
+{
+  "name": "hi-agent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "type-check": "vue-tsc --noEmit",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.8.1",
+    "@tauri-apps/plugin-notification": "^2.8.1",
+    "@tauri-apps/plugin-opener": "^2",
+    "element-plus": "^2.14.7",
+    "highlight.js": "^11.12.0",
+    "markdown-it": "^14.3.2",
+    "markdown-it-cjk-friendly": "^3.0.0",
+    "vue": "^3.5.13",
+    "vue-router": "^5.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/markdown-it": "^14.2.0",
+    "@types/node": "^26.6.6",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "typescript": "^6.0.3",
+    "vite": "^7.0.0",
+    "vue-tsc": "^3.3.14"
+  }
+}
